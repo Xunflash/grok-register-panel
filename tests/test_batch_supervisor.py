@@ -171,10 +171,50 @@ raise SystemExit(0)
         assert result == 0
 
 
+def test_supervisor_idle_timer_refreshes_on_heartbeat_lines():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        progress = root / "progress.json"
+        launches = root / "launches.txt"
+        child = root / "heartbeat_child.py"
+        child.write_text(
+            """
+import sys
+import time
+from pathlib import Path
+from batch_supervisor import mark_slot_completed
+Path(sys.argv[1]).write_text("1")
+for _ in range(5):
+    print("Grok2API 导入中 grok_build heartbeat", flush=True)
+    time.sleep(0.4)
+mark_slot_completed(int(sys.argv[2]))
+print("done", flush=True)
+""".lstrip(),
+            encoding="utf-8",
+        )
+        result = run_supervisor(
+            2,
+            1,
+            lambda remaining, _workers: [
+                sys.executable,
+                str(child),
+                str(launches),
+                str(remaining),
+            ],
+            progress_file=progress,
+            idle_timeout=1,
+            max_restarts=2,
+            child_env={"PYTHONPATH": str(ROOT)},
+        )
+        assert result == 0
+        assert launches.read_text() == "1"
+
+
 if __name__ == "__main__":
     test_driver_crash_detection_is_specific()
     test_progress_updates_are_thread_safe_and_private()
     test_supervisor_restarts_after_driver_crash()
     test_supervisor_does_not_restart_precheck_failure()
     test_clean_exit_drains_pipe_before_restart_decision()
+    test_supervisor_idle_timer_refreshes_on_heartbeat_lines()
     print("OK batch supervisor")

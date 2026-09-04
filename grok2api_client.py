@@ -1,0 +1,372 @@
+# -*- coding: utf-8 -*-
+"""面向对象的 Grok2API 管理端客户端。"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+
+from curl_cffi import CurlMime, requests
+
+
+class Grok2APIImportError(RuntimeError):
+    """远程 Grok2API 登录或导入失败。"""
+
+
+class Grok2APIClient:
+    """封装管理员登录、令牌复用、multipart 上传与 SSE 结果解析。"""
+
+    LOGIN_PATH = "/api/admin/v1/auth/login"
+    IMPORT_PATH = "/api/admin/v1/accounts/import"
+    IMPORT_PATHS = {
+        "grok_build": "/api/admin/v1/accounts/import",
+        "grok_web": "/api/admin/v1/accounts/web/import",
+        "grok_console": "/api/admin/v1/accounts/console/import",
+    }
+    CONFIG_KEYS = (
+        "grok2api_remote_url",
+        "grok2api_remote_username",
+        "grok2api_remote_password",
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        *,
+        session: Any = None,
+        login_timeout: float = 20,
+        import_timeout: float = 120,
+    ) -> None:
+        self.base_url = self._normalize_base_url(base_url)
+        self.username = str(username or "").strip()
+        self.password = str(password or "")
+        if not self.username or not self.password:
+            raise Grok2APIImportError("Grok2API 管理员账号或密码为空")
+        self.login_timeout = float(login_timeout)
+        self.import_timeout = float(import_timeout)
+        self._owns_session = session is None
+        # Grok2API 是独立管理服务，不继承项目代理或环境代理。
+        self.session = session or requests.Session(trust_env=False)
+        self._access_token = ""
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, Any],
+        *,
+        session: Any = None,
+        login_timeout: float = 20,
+        import_timeout: float = 120,
+    ) -> "Grok2APIClient":
+        """从项目配置创建客户端，并统一校验必填字段。"""
+        if not cls.is_configured(config):
+            raise Grok2APIImportError(
+                "请先完整配置 Grok2API API 地址、管理员账号和密码"
+            )
+        return cls(
+            str(config.get("grok2api_remote_url") or ""),
+            str(config.get("grok2api_remote_username") or ""),
+            str(config.get("grok2api_remote_password") or ""),
+            session=session,
+            login_timeout=login_timeout,
+            import_timeout=import_timeout,
+        )
+
+    @classmethod
+    def is_configured(cls, config: Mapping[str, Any]) -> bool:
+        return all(str(config.get(key, "") or "").strip() for key in cls.CONFIG_KEYS)
+
+    @property
+    def access_token(self) -> str:
+        """只读暴露当前会话令牌，便于诊断是否已登录。"""
+        return self._access_token
+
+    @staticmethod
+    def _normalize_base_url(value: str) -> str:
+        base = str(value or "").strip().rstrip("/")
+        if not base:
+            raise Grok2APIImportError("Grok2API API 地址为空")
+        if not base.startswith(("http://", "https://")):
+            raise Grok2APIImportError(
+                "Grok2API API 地址必须以 http:// 或 https:// 开头"
+            )
+        return base
+
+    @staticmethod
+    def _response_error(response: Any, fallback: str) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"])
+            if payload.get("message"):
+                return str(payload["message"])
+        status = int(getattr(response, "status_code", 0) or 0)
+        return f"{fallback} (HTTP {status})" if status else fallback
+
+    @staticmethod
+    def _iter_sse_events(
+        lines: Iterable[Any],
+        *,
+        on_comment: Optional[Callable[[str], None]] = None,
+    ) -> Iterable[tuple[str, Dict[str, Any]]]:
+        event = "message"
+        data_lines: list[str] = []
+        for raw in lines:
+            line = (
+                raw.decode("utf-8", errors="replace")
+                if isinstance(raw, bytes)
+                else str(raw or "")
+            ).rstrip("\r\n")
+            if not line:
+                if data_lines:
+                    yield event, Grok2APIClient._decode_sse_data(data_lines)
+                event, data_lines = "message", []
+                continue
+            if line.startswith(":"):
+                if on_comment:
+                    on_comment(line[1:].strip() or "heartbeat")
+                continue
+            if line.startswith("event:"):
+                event = line[6:].strip() or "message"
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if data_lines:
+            yield event, Grok2APIClient._decode_sse_data(data_lines)
+
+    @staticmethod
+    def _decode_sse_data(data_lines: Iterable[str]) -> Dict[str, Any]:
+        raw_data = "\n".join(data_lines)
+        try:
+            payload = json.loads(raw_data)
+        except json.JSONDecodeError:
+            payload = {"message": raw_data}
+        return payload if isinstance(payload, dict) else {"data": payload}
+
+    @staticmethod
+    def _tag_batch2_name(name: object) -> str:
+        value = str(name or "").strip()
+        if not value or value.startswith("[b2]") or value.startswith("【b2】"):
+            return value
+        return "[b2] " + value
+
+    @classmethod
+    def _tag_batch2_payload(cls, payload: object) -> object:
+        if isinstance(payload, dict):
+            accounts = payload.get("accounts")
+            if isinstance(accounts, list):
+                for item in accounts:
+                    if isinstance(item, dict) and item.get("name"):
+                        item["name"] = cls._tag_batch2_name(item.get("name"))
+            elif payload.get("name") and (
+                "email" in payload
+                or "sso_token" in payload
+                or "access_token" in payload
+                or payload.get("provider")
+            ):
+                payload["name"] = cls._tag_batch2_name(payload.get("name"))
+        return payload
+
+    @classmethod
+    def _load_auth_document(cls, file_path: str | Path) -> tuple[Path, bytes]:
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            raise Grok2APIImportError("Grok2API 授权 JSON 文件不存在")
+        try:
+            content = path.read_bytes()
+            payload = json.loads(content.decode("utf-8"))
+            payload = cls._tag_batch2_payload(payload)
+            content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise Grok2APIImportError(f"Grok2API 授权 JSON 无效: {exc}") from exc
+        return path, content
+
+    def login(self, *, force: bool = False) -> str:
+        """使用管理员账号密码登录；同一实例默认复用已取得的令牌。"""
+        if self._access_token and not force:
+            return self._access_token
+        try:
+            response = self.session.post(
+                f"{self.base_url}{self.LOGIN_PATH}",
+                json={"username": self.username, "password": self.password},
+                headers={"Accept": "application/json"},
+                timeout=self.login_timeout,
+            )
+        except Exception as exc:
+            raise Grok2APIImportError(f"连接 Grok2API 登录接口失败: {exc}") from exc
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            raise Grok2APIImportError(self._response_error(response, "Grok2API 登录失败"))
+        try:
+            payload = response.json()
+            token = str(payload["data"]["tokens"]["accessToken"] or "").strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise Grok2APIImportError("Grok2API 登录响应缺少 accessToken") from exc
+        if not token:
+            raise Grok2APIImportError("Grok2API 登录响应缺少 accessToken")
+        self._access_token = token
+        return token
+
+    def import_auth_file(
+        self,
+        file_path: str | Path,
+        format_name: str = "grok_build",
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """自动登录并将一个 grok_build JSON 导入远程管理端。"""
+        normalized_format = str(format_name or "").strip().lower() or "grok_build"
+        import_path = self.IMPORT_PATHS.get(normalized_format)
+        if not import_path:
+            raise Grok2APIImportError(
+                "Grok2API import format must be grok_build, grok_web, or grok_console"
+            )
+        path, content = self._load_auth_document(file_path)
+        token = self.login()
+        multipart = CurlMime()
+        multipart.addpart(
+            name="files",
+            filename=path.name,
+            content_type="application/json",
+            data=content,
+        )
+        response = None
+        stop = threading.Event()
+        started = time.monotonic()
+
+        def _beat() -> None:
+            while not stop.wait(15.0):
+                if progress:
+                    progress(f"waiting {int(time.monotonic() - started)}s")
+
+        beater = threading.Thread(target=_beat, name="g2a-import-beat", daemon=True)
+        beater.start()
+        try:
+            request_kwargs = {
+                "headers": {
+                    "Accept": "text/event-stream",
+                    "Authorization": f"Bearer {token}",
+                    "Cache-Control": "no-cache",
+                },
+                "multipart": multipart,
+                "timeout": self.import_timeout,
+                "stream": True,
+            }
+            try:
+                response = self.session.post(
+                    f"{self.base_url}{import_path}", **request_kwargs
+                )
+            except TypeError as exc:
+                if "multipart" not in str(exc):
+                    raise
+                request_kwargs.pop("multipart", None)
+                request_kwargs["files"] = {
+                    "files": (path.name, content, "application/json")
+                }
+                response = self.session.post(
+                    f"{self.base_url}{import_path}", **request_kwargs
+                )
+        except Exception as exc:
+            stop.set()
+            raise Grok2APIImportError(f"连接 Grok2API 导入接口失败: {exc}") from exc
+        finally:
+            if response is None:
+                multipart.close()
+
+        try:
+            if int(getattr(response, "status_code", 0) or 0) != 200:
+                raise Grok2APIImportError(
+                    self._response_error(response, "Grok2API 导入失败")
+                )
+            completed: Dict[str, Any] | None = None
+
+            def _on_comment(comment: str) -> None:
+                if progress:
+                    progress(comment or "heartbeat")
+
+            for event, payload in self._iter_sse_events(
+                response.iter_lines(),
+                on_comment=_on_comment,
+            ):
+                if event == "progress" and progress:
+                    phase = str(payload.get("phase") or "")
+                    progress(
+                        f"progress {phase} {payload.get('completed')}/{payload.get('total')}"
+                    )
+                if event == "error":
+                    raise Grok2APIImportError(
+                        str(
+                            payload.get("message")
+                            or payload.get("code")
+                            or "Grok2API 导入失败"
+                        )
+                    )
+                if event == "complete":
+                    completed = payload
+            if completed is None:
+                raise Grok2APIImportError(
+                    "Grok2API 导入响应未返回 complete 事件"
+                )
+            return completed
+        finally:
+            stop.set()
+            try:
+                response.close()
+            except Exception:
+                pass
+            multipart.close()
+
+    @classmethod
+    def import_auth_paths(
+        cls,
+        config: Mapping[str, Any],
+        paths: Mapping[str, Path],
+        *,
+        progress: Optional[Callable[[str, str], None]] = None,
+        max_workers: int = 3,
+    ) -> Dict[str, Dict[str, Any]]:
+        """并导入 grok_build/web/console，HTTP 路径与逐个 import_auth_file 相同。"""
+        items = [(str(name), Path(path)) for name, path in (paths or {}).items() if path]
+        if not items:
+            return {}
+
+        def _one(item: tuple[str, Path]) -> tuple[str, Dict[str, Any]]:
+            name, path = item
+            with cls.from_config(config) as client:
+                def _prog(message: str) -> None:
+                    if progress:
+                        progress(name, message)
+
+                return name, client.import_auth_file(
+                    path, format_name=name, progress=_prog
+                )
+
+        workers = max(1, min(int(max_workers or 1), len(items)))
+        out: Dict[str, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, item) for item in items]
+            for future in as_completed(futures):
+                name, payload = future.result()
+                out[name] = payload
+        return out
+
+    def close(self) -> None:
+        """释放客户端自行创建的 HTTP 会话。"""
+        if not self._owns_session:
+            return
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "Grok2APIClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()

@@ -49,7 +49,12 @@ import register_flow as _rf
 import connectivity as _conn
 from batch_supervisor import mark_slot_completed
 from batch_traffic import mark_successful_account
-from retry_policy import proxy_boot_rotations, slot_retries
+from retry_policy import (
+    ReusableResourceError,
+    proxy_boot_rotations,
+    should_count_as_failure,
+    slot_retries,
+)
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -58,6 +63,7 @@ from secure_files import (
     ensure_private_dir,
     exclusive_file_lock,
 )
+from webui import proxy_store as _proxy_store
 from webui.proxy_store import (
     IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
     mark_proxy_used as _mark_managed_proxy_used,
@@ -74,6 +80,7 @@ from webui.email_domain_store import (
     select_domain as _select_managed_email_domain,
 )
 from webui.security_utils import redact_log_line as redact_sensitive_log_line
+from resin_sticky import with_resin_platform as _with_resin_platform
 from browser_session import (
 
     browser,
@@ -93,6 +100,12 @@ from browser_session import (
     get_exit_ip,
     get_bound_proxy,
     clear_exit_context,
+    is_blocked_exit_ip,
+    is_guard_blocked_exit_ip,
+    block_exit_ip,
+    exit_ip_allowed,
+    exit_ip_prefixes,
+    set_proxy_rotate_hook,
 )
 from register_flow import (
     SIGNUP_URL,
@@ -108,6 +121,15 @@ from register_flow import (
     build_profile,
     fill_profile_and_submit,
     wait_for_sso_cookie,
+)
+from signup_scheme import (
+    ENV_NAME as REGISTRATION_SCHEME_ENV,
+    SCHEME_BROWSER,
+    SCHEME_LABELS,
+    SCHEME_PROTOCOL,
+    load_registration_scheme,
+    maybe_run_protocol_signup,
+    resolve_registration_scheme,
 )
 
 
@@ -245,8 +267,22 @@ DEFAULT_CONFIG = {
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
     "outlook_rt_client_id": outlook_rt_provider.DEFAULT_CLIENT_ID,
+    # Outlook RT 刷 token / Graph 走 Resin 平台（Default/xfpack 拦微软登录）
+    "outlook_rt_resin_platform": "outlook",
+    "guard_url": "http://192.168.0.5:8788",
+    "guard_token": "",
+    # 注册机等 Guard 新号检测的秒数。0=跟随 Guard 策略；默认 300=5 分钟。
+    "guard_register_check_timeout_seconds": 300,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
+    "registration_scheme": "browser",
+    "turnstile_provider": "yescaptcha",
+    "yescaptcha_key": "",
+    "yescaptcha_api": "https://cn.yescaptcha.com",
+    "capsolver_key": "",
+    "capsolver_api": "https://api.capsolver.com",
+    "turnstile_fallback_local": False,
+    "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -646,7 +682,7 @@ def load_proxy_pool(path: str = "") -> list:
     candidates = []
     if path:
         candidates.append(Path(path))
-    candidates.append(Path(APP_DIR) / "proxies.txt")
+    candidates.append(_proxy_store.LEGACY_PATH)
     pool = []
     for fp in candidates:
         try:
@@ -745,6 +781,12 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
             if ip and ip in hot_ips and cand != current:
                 continue
+            if ip:
+                blocked, _meta = is_guard_blocked_exit_ip(ip)
+                if blocked:
+                    continue
+            if not exit_ip_allowed(ip):
+                continue
             ranked.append((-_age(cand), offset, cand))
         ranked.sort()
         selected = ranked[0][2] if ranked else ""
@@ -753,10 +795,16 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
                 (-_age(cand), idx, cand)
                 for idx, cand in enumerate(pool)
                 if cand not in others
+                and exit_ip_allowed(str((by_url.get(cand) or {}).get("exit_ip") or "").strip())
             ]
             leftovers.sort()
             selected = leftovers[0][2] if leftovers else ""
         if not selected:
+            if exit_ip_prefixes():
+                raise RuntimeError(
+                    "面板代理池没有允许段内的出口 IP: "
+                    + ",".join(exit_ip_prefixes())
+                )
             selected = pool[(wid + rot) % len(pool)]
         _proxy_leases[wid] = selected
     try:
@@ -826,6 +874,45 @@ def _apply_mail_direct(url, request_kwargs: dict) -> dict:
         rk["proxies"] = {}
         return rk
     return request_kwargs
+
+
+_OUTLOOK_RT_PROXY_HOSTS = (
+    "login.microsoftonline.com",
+    "login.live.com",
+    "graph.microsoft.com",
+)
+
+
+def _outlook_rt_resin_platform() -> str:
+    return str(config.get("outlook_rt_resin_platform") or "").strip()
+
+
+def _is_outlook_rt_microsoft_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(str(url or "")).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return False
+    return any(host == item or host.endswith("." + item) for item in _OUTLOOK_RT_PROXY_HOSTS)
+
+
+def _apply_outlook_rt_proxy(url, request_kwargs: dict) -> dict:
+    """Outlook RT 的微软登录/Graph 改走 Resin outlook 平台，避免 xfpack 502。"""
+    platform = _outlook_rt_resin_platform()
+    if not platform or not _is_outlook_rt_microsoft_url(url):
+        return request_kwargs
+    rk = dict(request_kwargs)
+    proxies = dict(rk.get("proxies") or get_proxies() or {})
+    if not proxies:
+        return rk
+    rewritten = {}
+    for key, value in proxies.items():
+        rewritten[key] = _with_resin_platform(str(value or ""), platform)
+    rk["proxies"] = rewritten
+    return rk
 
 
 def get_duckmail_api_base():
@@ -1082,36 +1169,174 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
     block, details = _registration_risk_should_block(state)
     if block:
         details = str(details or state.get("bot_flag_details") or "registration_risk")
-        _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
-        try:
-            _bf = state.get("bot_flag_source")
-            _rk = None
-            _mrisk = re.search(r"risk=([\d.]+)", str(details))
-            if _mrisk:
-                try:
-                    _rk = float(_mrisk.group(1))
-                except Exception:
-                    _rk = None
-            record_register_result(
-                "risk",
-                email or "",
-                kind=FAIL_RISK,
-                detail=f"botFlagSource={_bf} {details}",
-                bot_flag=_bf,
-                risk=_rk,
-                log_callback=log_callback,
-            )
-        except Exception:
-            pass
-        raise RegistrationRiskDenied(
-            "注册风控拒绝，已跳过 OAuth: "
+        _risk_log(
+            "SSO 命中风控字段，仍导入 grok2api 并等 Guard 新号检测后再拉黑: "
             f"botFlagSource={state.get('bot_flag_source')} {details}"
         )
-    if not state.get("found"):
+        _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
+    elif not state.get("found"):
         _risk_log(f"未读取到注册风控字段，继续 OAuth: {state.get('error') or 'unknown'}")
     elif state.get("bot_flag_source") == 0:
         _risk_log("注册风控状态可用: botFlagSource=0")
     return state
+
+
+
+def _guard_register_timeout_seconds() -> int:
+    """0 = follow Guard policy; otherwise clamp to 30s..30min."""
+    try:
+        value = int(config.get("guard_register_check_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        value = 300
+    if value <= 0:
+        return 0
+    return max(30, min(1800, value))
+
+
+def _guard_register_check(email: str, log_callback=None) -> dict:
+    """Ask Guard to finish new-account detection, then optionally blacklist."""
+    url = str(config.get("guard_url") or "http://192.168.0.5:8788").rstrip("/")
+    token = str(config.get("guard_token") or "").strip()
+    if not url:
+        return {}
+    exit_ip = ""
+    try:
+        exit_ip = get_exit_ip() or ""
+    except Exception:
+        exit_ip = ""
+    timeout_seconds = _guard_register_timeout_seconds()
+    if timeout_seconds <= 0:
+        timeout_seconds = 300
+    http_timeout = timeout_seconds + 60
+    body = {
+        "email": str(email or "").strip(),
+        "egress_ip": exit_ip,
+        "timeout_seconds": timeout_seconds,
+    }
+    if log_callback:
+        log_callback(
+            f"[guard] 新号检测开始 email={email} ip={exit_ip or '?'} "
+            f"timeout={timeout_seconds}s"
+        )
+    stop = threading.Event()
+
+    def _beat() -> None:
+        started = time.monotonic()
+        while not stop.wait(30):
+            elapsed = int(time.monotonic() - started)
+            if log_callback:
+                log_callback(f"[guard] 新号检测等待中 {elapsed}s/{timeout_seconds}s")
+
+    beater = threading.Thread(
+        target=_beat, name="guard-register-check-beat", daemon=True
+    )
+    beater.start()
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url + "/api/register-check",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Guard-Control-Token": token,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[guard] 新号检测失败，本号不拉黑: {exc}")
+        return {"risk": False, "error": str(exc), "timed_out": True}
+    finally:
+        stop.set()
+    if not isinstance(payload, dict):
+        return {"risk": False, "error": "invalid guard payload"}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return data if isinstance(data, dict) else {"risk": False}
+
+
+def _mark_outlook_used_for_guard(email: str, log_callback=None) -> None:
+    if str(config.get("email_provider") or "").strip() != "outlook_rt":
+        return
+    inv = get_outlook_rt_inventory()
+    if not inv or not email:
+        return
+    try:
+        outlook_rt_provider.mark_used(
+            email,
+            inv,
+            get_outlook_rt_used_path(),
+            reason="guard_risk",
+        )
+        if log_callback:
+            log_callback(f"[guard] Outlook 已标记 used: {email}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[guard] Outlook 标记 used 失败: {exc}")
+
+
+def _apply_guard_register_result(email: str, payload: dict, log_callback=None) -> None:
+    if not payload:
+        return
+    if payload.get("error") or payload.get("timed_out"):
+        if log_callback and not payload.get("error"):
+            log_callback("[guard] 新号检测超时，本号不拉黑")
+        return
+    if not payload.get("risk"):
+        if log_callback:
+            log_callback(
+                "[guard] 新号检测通过 "
+                f"classification={payload.get('classification') or 'normal'} "
+                f"thinking={payload.get('thinking_seen')}"
+            )
+        try:
+            from browser_session import mark_recorded_har_success
+
+            mark_recorded_har_success(email)
+        except Exception:
+            pass
+        return
+    seconds = payload.get("blacklist_seconds") or 18000
+    exit_ip = ""
+    try:
+        exit_ip = str(payload.get("egress_ip") or get_exit_ip() or "")
+    except Exception:
+        exit_ip = str(payload.get("egress_ip") or "")
+    try:
+        from browser_session import block_exit_ip
+        if exit_ip:
+            block_exit_ip(exit_ip, seconds, reason=str(payload.get("reason") or "guard_risk"))
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[guard] 本地出口 TTL 写入失败: {exc}")
+    _mark_outlook_used_for_guard(email, log_callback=log_callback)
+    detail = (
+        f"classification={payload.get('classification')} "
+        f"reason={payload.get('reason')} "
+        f"ip={exit_ip or '?'} "
+        f"blacklist={seconds}s "
+        f"deleted={payload.get('deleted')} "
+        f"blacklisted={payload.get('blacklisted')}"
+    )
+    if log_callback:
+        log_callback(f"[guard] 新号检测风控，拉黑出口并删号: {detail}")
+    try:
+        record_register_result(
+            "risk",
+            email or "",
+            kind=FAIL_RISK,
+            detail=detail,
+            bot_flag=payload.get("bot_flag_source"),
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
+    raise RegistrationRiskDenied(
+        "Guard 新号检测风控: "
+        f"{payload.get('classification') or payload.get('reason') or 'risk'}"
+    )
 
 
 def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
@@ -1283,9 +1508,45 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 _cpa_log(f"CPA 远程上传失败: {remote_exc}")
         if g2a_dir:
             try:
-                gpath = _s2cpa.write_grok2api_auth(_s2cpa.Path(g2a_dir), token, email=email)
-                _cpa_log(f"已写入 Grok2API {gpath}")
+                gpaths = _s2cpa.write_grok2api_auth_bundle(
+                    _s2cpa.Path(g2a_dir), token, email=email, sso=sso
+                )
+                _cpa_log(
+                    "已写入 Grok2API "
+                    + ", ".join(f"{kind}={path.name}" for kind, path in gpaths.items())
+                )
                 wrote_ok = True
+                auto_import = config.get("grok2api_auto_import", True)
+                if isinstance(auto_import, str):
+                    auto_import = auto_import.strip().lower() not in ("0", "false", "no", "off")
+                if auto_import:
+                    try:
+                        from grok2api_client import Grok2APIClient
+                        if not Grok2APIClient.is_configured(config):
+                            _cpa_log("Grok2API 远程未完整配置，跳过导入")
+                        else:
+                            import_paths = dict(gpaths)
+                            if not str(sso or "").strip():
+                                _cpa_log("无 SSO，仅导入 grok_build（guard 会因无 web SSO 跳过）")
+                                import_paths = {"grok_build": gpaths["grok_build"]}
+
+                            def _import_progress(format_name: str, message: str) -> None:
+                                _cpa_log(f"Grok2API 导入中 {format_name} {message}")
+
+                            remotes = Grok2APIClient.import_auth_paths(
+                                config,
+                                import_paths,
+                                progress=_import_progress,
+                            )
+                            for format_name, remote in remotes.items():
+                                _cpa_log(
+                                    f"已导入远程 Grok2API {format_name} "
+                                    + f"created={remote.get('created', 0)} "
+                                    + f"updated={remote.get('updated', 0)} "
+                                    + f"synced={remote.get('synced', 0)}"
+                                )
+                    except Exception as imp_exc:
+                        _cpa_log(f"Grok2API 远程导入失败: {imp_exc}")
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
         if not wrote_ok:
@@ -1306,7 +1567,29 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 )
             except Exception:
                 pass
+        imported = bool(config.get("grok2api_auto_import", True))
+        if isinstance(config.get("grok2api_auto_import", True), str):
+            imported = str(config.get("grok2api_auto_import")).strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+        if imported:
+            try:
+                _apply_guard_register_result(
+                    email,
+                    _guard_register_check(email, log_callback=log_callback),
+                    log_callback,
+                )
+            except RegistrationRiskDenied:
+                raise
+            except Exception as guard_exc:
+                if log_callback:
+                    log_callback(f"[guard] 新号检测异常，本号不拉黑: {guard_exc}")
         return True
+    except RegistrationRiskDenied:
+        raise
     except Exception as exc:
         _cpa_log(f"直出失败: {redact_sensitive_log_line(str(exc))}")
         _append_sso_pending(email, sso, log_callback=log_callback)
@@ -1336,6 +1619,7 @@ def http_get(url, **kwargs):
         return _std_requests.get(url, proxies={}, **clean)
     try:
         rk = _build_request_kwargs(**kwargs)
+        rk = _apply_outlook_rt_proxy(url, rk)
         return requests.get(url, **rk)
     except Exception as exc:
         err = str(exc)
@@ -1360,6 +1644,7 @@ def http_post(url, **kwargs):
         rk = _build_request_kwargs(**kwargs)
         if "_apply_mail_direct" in globals():
             rk = _apply_mail_direct(url, rk)
+        rk = _apply_outlook_rt_proxy(url, rk)
         return requests.post(url, **rk)
     except Exception as exc:
         err = str(exc)
@@ -1886,12 +2171,12 @@ def get_email_and_token(api_key=None):
                     http_post,
                     api_base,
                     domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
-                    accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
+                    accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/admin/new_address"),
                     token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
                     api_key=api_key or get_cloudflare_api_key(),
                     auth_mode=get_cloudflare_auth_mode(),
                     custom_auth=get_cloudflare_custom_auth(),
-                    domain=managed_domain,
+                    domain=managed_domain or cloudflare_next_default_domain(),
                     randomize_subdomain=cloudflare_randomize_subdomain_enabled(),
                 )
             except Exception as fallback_exc:
@@ -1977,6 +2262,21 @@ def outlook_rt_get_code(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
     )
+
+
+def outlook_rt_settle_attempt(
+    email: str,
+    *,
+    outcome: str,
+    reason: str = "",
+    log_callback=None,
+) -> None:
+    """库存仍在取码时记 used。Turnstile/中断不再退回库存。"""
+    return
+
+
+def outlook_rt_settle_from_failure(email: str, exc, log_callback=None) -> None:
+    return
 
 
 def get_oai_code(
@@ -2671,6 +2971,94 @@ def _wire_runtime_modules():
         AccountRetryNeeded=AccountRetryNeeded,
     )
 
+
+def current_registration_scheme() -> str:
+    return load_registration_scheme(config=config)
+
+
+def run_browser_signup(log_callback, cancel_callback, *, mail_retries=3):
+    """Original Camoufox form-click signup. Returns email/profile/sso."""
+    email = ""
+    dev_token = ""
+    code = ""
+    mail_ok = False
+    max_mail_retry = max(1, int(mail_retries or 1))
+    for mail_try in range(1, max_mail_retry + 1):
+        log_callback(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+        open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback)
+        log_callback("[*] 2. 创建邮箱并提交")
+        email, dev_token = fill_email_and_submit(
+            log_callback=log_callback, cancel_callback=cancel_callback
+        )
+        log_callback(f"[*] 邮箱: {email}")
+        log_callback(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
+        try:
+            append_private_text(
+                accounts_side_file("mail_credentials.txt"),
+                f"{email}\t{dev_token}\n",
+            )
+        except Exception:
+            pass
+        log_callback("[*] 3. 拉取验证码")
+        try:
+            code = fill_code_and_submit(
+                email,
+                dev_token,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            mail_ok = True
+            break
+        except Exception as mail_exc:
+            msg = str(mail_exc)
+            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                log_callback(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                restart_browser(log_callback=log_callback)
+                sleep_with_cancel(1, cancel_callback)
+                continue
+            raise
+    if not mail_ok:
+        raise Exception("验证码阶段失败，已达到最大重试次数")
+    log_callback(f"[*] 验证码: {code}")
+    log_callback("[*] 4. 填写资料")
+    profile = fill_profile_and_submit(
+        log_callback=log_callback, cancel_callback=cancel_callback
+    )
+    log_callback(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+    log_callback("[*] 5. 等待 sso cookie")
+    sso = wait_for_sso_cookie(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        email=email,
+        password=profile.get("password", ""),
+    )
+    return {
+        "email": email,
+        "profile": profile,
+        "sso": sso,
+        "scheme": SCHEME_BROWSER,
+    }
+
+
+def signup_until_sso(log_callback, cancel_callback, *, mail_retries=3):
+    """Run one signup according to registration_scheme. Returns email/profile/sso."""
+    raise_if_cancelled(cancel_callback)
+    scheme = current_registration_scheme()
+    os.environ[REGISTRATION_SCHEME_ENV] = scheme
+    protocol_outcome = maybe_run_protocol_signup(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+    if protocol_outcome is not None:
+        return protocol_outcome
+    log_callback(f"[*] 注册方案: {SCHEME_LABELS[SCHEME_BROWSER]}")
+    return run_browser_signup(
+        log_callback,
+        cancel_callback,
+        mail_retries=mail_retries,
+    )
+
+
 # register page flow -> register_flow
 
 class GrokRegisterGUI:
@@ -2805,6 +3193,22 @@ class GrokRegisterGUI:
         tk_label(opt_frame, text="日志:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
         self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
         self.log_level_combo.pack(side=tk.LEFT)
+        tk_label(opt_frame, text="打码:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
+        self.turnstile_provider_var = tk.StringVar(
+            value=str(config.get("turnstile_provider") or "yescaptcha")
+        )
+        self.turnstile_provider_combo = tk_option_menu(
+            opt_frame, self.turnstile_provider_var, ["capsolver", "yescaptcha", "local"], width=12
+        )
+        self.turnstile_provider_combo.pack(side=tk.LEFT)
+        tk_label(opt_frame, text="方案:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
+        self.registration_scheme_var = tk.StringVar(
+            value=str(config.get("registration_scheme") or SCHEME_BROWSER)
+        )
+        self.registration_scheme_combo = tk_option_menu(
+            opt_frame, self.registration_scheme_var, [SCHEME_BROWSER, SCHEME_PROTOCOL], width=10
+        )
+        self.registration_scheme_combo.pack(side=tk.LEFT)
 
         add_label(1, 2, "代理（可选）:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -3574,6 +3978,19 @@ class GrokRegisterGUI:
         workers = max(1, min(workers, 24, count))
         config["register_count"] = count
         config["register_workers"] = workers
+        config["turnstile_provider"] = str(
+            getattr(self, "turnstile_provider_var", None)
+            and self.turnstile_provider_var.get()
+            or config.get("turnstile_provider")
+            or "yescaptcha"
+        ).strip()
+        config["registration_scheme"] = resolve_registration_scheme(
+            getattr(self, "registration_scheme_var", None)
+            and self.registration_scheme_var.get()
+            or config.get("registration_scheme")
+            or SCHEME_BROWSER
+        )
+        os.environ[REGISTRATION_SCHEME_ENV] = config["registration_scheme"]
         save_config()
         self.stop_requested = False
         self.success_count = 0
@@ -3699,64 +4116,17 @@ class GrokRegisterGUI:
                 if self.should_stop():
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                email = ""
+                settle_outcome = "retryable"
+                settle_reason = ""
                 try:
                     email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        wlog(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=wlog, cancel_callback=self.should_stop
-                        )
-                        wlog("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=wlog, cancel_callback=self.should_stop
-                        )
-                        wlog(f"[*] 邮箱: {email}")
-                        wlog(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
-                        try:
-                            append_private_text(
-                                accounts_side_file("mail_credentials.txt"),
-                                f"{email}\t{dev_token}\n",
-                            )
-                        except Exception:
-                            pass
-                        wlog("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=wlog,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=wlog)
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
-
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    wlog(f"[*] 验证码: {code}")
-                    wlog("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=wlog, cancel_callback=self.should_stop
+                    outcome = signup_until_sso(
+                        wlog, self.should_stop, mail_retries=3
                     )
-                    wlog(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    wlog("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=wlog,
-                        cancel_callback=self.should_stop,
-                        email=email,
-                        password=profile.get("password", ""),
-                    )
+                    email = outcome.get("email") or ""
+                    profile = outcome.get("profile") or {}
+                    sso = outcome.get("sso") or ""
                     ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
                     if config.get("enable_nsfw", True):
                         wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
@@ -3798,6 +4168,8 @@ class GrokRegisterGUI:
                         wlog(f"[+] 注册成功: {email}")
                     else:
                         wlog(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                    settle_outcome = "success"
+                    settle_reason = "register_ok"
                     if (
                         self.success_count > 0
                         and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
@@ -3809,12 +4181,15 @@ class GrokRegisterGUI:
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
                 except RegistrationCancelled:
+                    settle_outcome = "retryable"
                     wlog("[!] 注册被用户停止")
                     break
                 except EmailDomainRejected as exc:
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
+                    settle_outcome = "dead"
+                    settle_reason = "domain_rejected"
                     wlog(
                         f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: "
                         f"{redact_sensitive_log_line(str(exc))}"
@@ -3822,6 +4197,7 @@ class GrokRegisterGUI:
                     wlog("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 except AccountRetryNeeded as exc:
                     retry_count_for_slot += 1
+                    settle_outcome = "retryable"
                     if retry_count_for_slot <= max_slot_retry:
                         wlog(
                             f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: "
@@ -3835,15 +4211,64 @@ class GrokRegisterGUI:
                         )
                         retry_count_for_slot = 0
                         i += 1
+                except ReusableResourceError as exc:
+                    retry_count_for_slot += 1
+                    settle_outcome = "retryable"
+                    if retry_count_for_slot <= max_slot_retry:
+                        wlog(
+                            f"[!] 协议收件前失败（未用邮箱/打码），重开浏览器或换出口 "
+                            f"{retry_count_for_slot}/{max_slot_retry}: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                    else:
+                        wlog(
+                            f"[!] 协议收件前仍失败（未用邮箱/打码，不计失败）: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                        retry_count_for_slot = 0
+                        i += 1
                 except Exception as exc:
-                    kind = self._record_failure(exc)
-                    retry_count_for_slot = 0
-                    i += 1
-                    wlog(
-                        f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
-                        f"{redact_sensitive_log_line(str(exc))}"
-                    )
+                    if not should_count_as_failure(exc):
+                        retry_count_for_slot += 1
+                        settle_outcome = "retryable"
+                        if retry_count_for_slot <= max_slot_retry:
+                            wlog(
+                                f"[!] 资源可重用，同槽位重试 {retry_count_for_slot}/{max_slot_retry}: "
+                                f"{redact_sensitive_log_line(str(exc))}"
+                            )
+                        else:
+                            wlog(
+                                f"[!] 资源可重用，跳过且不计失败: "
+                                f"{redact_sensitive_log_line(str(exc))}"
+                            )
+                            retry_count_for_slot = 0
+                            i += 1
+                    else:
+                        kind = self._record_failure(exc)
+                        retry_count_for_slot = 0
+                        i += 1
+                        if kind in (FAIL_DOMAIN, FAIL_RISK, FAIL_CPA):
+                            settle_outcome, settle_reason = (
+                                "dead",
+                                {
+                                    FAIL_DOMAIN: "domain_rejected",
+                                    FAIL_RISK: "guard_risk",
+                                    FAIL_CPA: "register_ok",
+                                }[kind],
+                            )
+                        else:
+                            settle_outcome = "retryable"
+                        wlog(
+                            f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
                 finally:
+                    outlook_rt_settle_attempt(
+                        email,
+                        outcome=settle_outcome,
+                        reason=settle_reason,
+                        log_callback=wlog,
+                    )
                     self.update_stats()
                 if self.should_stop():
                     break
@@ -3932,6 +4357,7 @@ def run_registration_cli(count):
     pool = load_proxy_pool()
     cli_log(
         f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | "
+        f"方案: {SCHEME_LABELS.get(current_registration_scheme(), current_registration_scheme())} | "
         f"代理池: {len(pool)} ({_proxy_pool_source})"
     )
     _cli_interval_raw = str(config.get("account_interval", "0") or "0").strip()
@@ -3946,20 +4372,36 @@ def run_registration_cli(count):
     except Exception:
         pass
     try:
+        precheck_candidates = []
+        for item in pool or []:
+            url = str(item or "").strip()
+            if url and url not in precheck_candidates:
+                precheck_candidates.append(url)
+        fallback_proxy = str(config.get("proxy") or "").strip()
+        if fallback_proxy and fallback_proxy not in precheck_candidates:
+            precheck_candidates.append(fallback_proxy)
+        if not precheck_candidates:
+            precheck_candidates = [""]
+        startup_checks = []
         startup_config = dict(config)
-        if pool:
-            startup_config["proxy"] = pool[0]
-        startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
-        for name, ok, detail in startup_checks:
-            cli_log(
-                f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
-                f"{redact_sensitive_log_line(detail)}"
-            )
-        if _conn.has_blocking_xai_failure(startup_checks):
-            _record_proxy_precheck_failure(
-                str(startup_config.get("proxy") or ""),
-                startup_checks,
-            )
+        precheck_ok = False
+        max_precheck = min(8, len(precheck_candidates))
+        for idx, proxy_url in enumerate(precheck_candidates[:max_precheck], 1):
+            startup_config = dict(config)
+            if proxy_url:
+                startup_config["proxy"] = proxy_url
+            startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
+            for name, ok, detail in startup_checks:
+                cli_log(
+                    f"[检查#{idx}] [{'OK' if ok else 'FAIL'}] {name}: "
+                    f"{redact_sensitive_log_line(detail)}"
+                )
+            if not _conn.has_blocking_xai_failure(startup_checks):
+                precheck_ok = True
+                break
+            _record_proxy_precheck_failure(proxy_url, startup_checks)
+            cli_log(f"[!] xAI 预检失败，换下一条代理 ({idx}/{max_precheck})")
+        if not precheck_ok:
             cli_log("[!] xAI 注册页预检失败，已停止当前批次；请检查或更换当前 proxy 后重试")
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
@@ -4002,6 +4444,18 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             rotate_idx = 0
+
+            def _rotate_proxy(_reason: str = "") -> None:
+                nonlocal rotate_idx
+                rotate_idx += 1
+                nxt = pick_proxy_for_worker(wid, rotate_idx)
+                set_thread_proxy(nxt)
+                cli_log(
+                    f"[W{wid+1}] [*] 跳过坏出口，换代理 #{rotate_idx}: "
+                    f"{redact_proxy(nxt)}"
+                )
+
+            set_proxy_rotate_hook(_rotate_proxy)
             try:
                 try:
                     px = pick_proxy_for_worker(wid, rotate_idx)
@@ -4067,6 +4521,8 @@ def run_registration_cli(count):
                 worker_stop = False
                 while i < n and not controller.should_stop() and not worker_stop:
                     email = ""
+                    settle_outcome = "retryable"
+                    settle_reason = ""
                     try:
                         delay = reserve_signup_submit_slot()
                         if delay >= 0.5:
@@ -4074,30 +4530,14 @@ def run_registration_cli(count):
                                 f"[W{wid+1}] [*] 错开提交 {delay:.0f}s，避免同时打验证码"
                             )
                             sleep_with_cancel(delay, controller.should_stop)
-                        open_signup_page(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                        outcome = signup_until_sso(
+                            lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            controller.should_stop,
+                            mail_retries=1,
                         )
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        profile = fill_profile_and_submit(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        sso = wait_for_sso_cookie(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                            email=email,
-                            password=profile.get("password", ""),
-                        )
+                        email = outcome.get("email") or ""
+                        profile = outcome.get("profile") or {}
+                        sso = outcome.get("sso") or ""
                         ensure_sso_oauth_eligible(
                             sso,
                             email=email,
@@ -4135,6 +4575,8 @@ def run_registration_cli(count):
                             cli_log(f"[W{wid+1}] [+] 注册成功: {email}")
                         else:
                             cli_log(f"[W{wid+1}] [+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                        settle_outcome = "success"
+                        settle_reason = "register_ok"
                         record_register_result(
                             "ok",
                             email,
@@ -4150,6 +4592,7 @@ def run_registration_cli(count):
                             rotate_idx += 1
                             cli_log(f"[W{wid+1}] [*] 已成功 {local_success} 个，下号换 IP #{rotate_idx}")
                     except RegistrationCancelled:
+                        settle_outcome = "retryable"
                         break
                     except EmailDomainRejected as exc:
                         kind = classify_failure(exc)
@@ -4157,6 +4600,8 @@ def run_registration_cli(count):
                         local_fail += 1
                         i += 1
                         retry = 0
+                        settle_outcome = "dead"
+                        settle_reason = "domain_rejected"
                         cli_log(
                             f"[W{wid+1}] [-] 域名拒绝: "
                             f"{redact_sensitive_log_line(str(exc))}"
@@ -4172,6 +4617,7 @@ def run_registration_cli(count):
                         mark_slot_completed()
                     except AccountRetryNeeded as exc:
                         retry += 1
+                        settle_outcome = "retryable"
                         if retry > max_slot_retry:
                             kind = classify_failure(exc)
                             local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -4183,6 +4629,24 @@ def run_registration_cli(count):
                                 f"{redact_sensitive_log_line(str(exc))}"
                             )
                             mark_slot_completed()
+                    except ReusableResourceError as exc:
+                        retry += 1
+                        settle_outcome = "retryable"
+                        rotate_idx += 1
+                        if retry <= max_slot_retry:
+                            cli_log(
+                                f"[W{wid+1}] [!] 协议收件前失败（未用邮箱/打码），"
+                                f"重开浏览器或换出口 {retry}/{max_slot_retry}: "
+                                f"{redact_sensitive_log_line(str(exc))}"
+                            )
+                            continue
+                        cli_log(
+                            f"[W{wid+1}] [!] 协议收件前仍失败（未用邮箱/打码，不计失败）: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                        i += 1
+                        retry = 0
+                        mark_slot_completed()
                     except Exception as exc:
                         msg = str(exc)
                         blank_ui = (
@@ -4219,15 +4683,29 @@ def run_registration_cli(count):
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
                         )
-                        if (blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
+                        companion_miss = "companion POSTs missing" in msg
+                        reusable = companion_miss or not should_count_as_failure(exc)
+                        if (
+                            blank_ui
+                            or proxy_dead
+                            or pipe_dead
+                            or turnstile_stuck
+                            or profile_soft
+                            or reusable
+                        ) and retry < max_slot_retry:
                             retry += 1
+                            settle_outcome = "retryable"
                             why = (
                                 "Playwright管道断开"
                                 if pipe_dead
                                 else (
                                     "Turnstile卡住"
                                     if turnstile_stuck
-                                    else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                    else (
+                                        "协议 companion 缺失"
+                                        if companion_miss
+                                        else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                    )
                                 )
                             )
                             cli_log(
@@ -4236,11 +4714,31 @@ def run_registration_cli(count):
                             )
                             rotate_idx += 1
                             continue
+                        if reusable:
+                            settle_outcome = "retryable"
+                            cli_log(
+                                f"[W{wid+1}] [!] 资源可重用，跳过且不计失败: "
+                                f"{redact_sensitive_log_line(str(exc))}"
+                            )
+                            i += 1
+                            retry = 0
+                            rotate_idx += 1
+                            mark_slot_completed()
+                            continue
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
                         i += 1
                         retry = 0
+                        if kind in (FAIL_DOMAIN, FAIL_RISK, FAIL_CPA):
+                            settle_outcome = "dead"
+                            settle_reason = {
+                                FAIL_DOMAIN: "domain_rejected",
+                                FAIL_RISK: "guard_risk",
+                                FAIL_CPA: "register_ok",
+                            }[kind]
+                        else:
+                            settle_outcome = "retryable"
                         cli_log(
                             f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: "
                             f"{redact_sensitive_log_line(str(exc))}"
@@ -4284,13 +4782,27 @@ def run_registration_cli(count):
                         elif local_success > 0 and local_success % 3 == 0:
                             rotate_idx += 1
                     finally:
-                        if i < n and not controller.should_stop():
-                            try:
-                                stop_browser()
-                                # 冷却：避免热重启立刻撞 SPA 空壳
-                                time.sleep(0.5)
-                            except Exception:
-                                pass
+                        outlook_rt_settle_attempt(
+                            email,
+                            outcome=settle_outcome,
+                            reason=settle_reason,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
+                        try:
+                            stop_browser()
+                            # 冷却：避免热重启立刻撞 SPA 空壳
+                            time.sleep(0.5)
+                        except Exception:
+                            pass
+                        try:
+                            from browser_session import last_saved_success_har
+
+                            saved_har = last_saved_success_har()
+                        except Exception:
+                            saved_har = ""
+                        if settle_outcome == "success" and saved_har:
+                            cli_log(f"[W{wid+1}] [*] success HAR {saved_har}")
+                        if i < n and not controller.should_stop() and not worker_stop:
                             try:
                                 px = pick_proxy_for_worker(wid, rotate_idx)
                                 set_thread_proxy(px)
@@ -4390,6 +4902,15 @@ def run_registration_cli(count):
 
     try:
         single_rotate_idx = 0
+
+        def _rotate_proxy_single(_reason: str = "") -> None:
+            nonlocal single_rotate_idx
+            single_rotate_idx += 1
+            nxt = pick_proxy_for_worker(0, single_rotate_idx)
+            set_thread_proxy(nxt)
+            cli_log(f"[*] 跳过坏出口，换代理 #{single_rotate_idx}: {redact_proxy(nxt)}")
+
+        set_proxy_rotate_hook(_rotate_proxy_single)
         last_boot = None
         boot_attempts = max(
             1,
@@ -4430,64 +4951,17 @@ def run_registration_cli(count):
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            email = ""
+            settle_outcome = "retryable"
+            settle_reason = ""
             try:
                 email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
-                    try:
-                        append_private_text(
-                            accounts_side_file("mail_credentials.txt"),
-                            f"{email}\t{dev_token}\n",
-                        )
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
-
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
+                outcome = signup_until_sso(
+                    cli_log, controller.should_stop, mail_retries=3
                 )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log,
-                    cancel_callback=controller.should_stop,
-                    email=email,
-                    password=profile.get("password", ""),
-                )
+                email = outcome.get("email") or ""
+                profile = outcome.get("profile") or {}
+                sso = outcome.get("sso") or ""
                 ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
@@ -4516,6 +4990,8 @@ def run_registration_cli(count):
                     cli_log(f"[+] 注册成功: {email}")
                 else:
                     cli_log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                settle_outcome = "success"
+                settle_reason = "register_ok"
                 record_register_result(
                     "ok",
                     email,
@@ -4535,12 +5011,15 @@ def run_registration_cli(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
+                settle_outcome = "retryable"
                 cli_log("[!] 注册被停止")
                 break
             except EmailDomainRejected as exc:
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
+                settle_outcome = "dead"
+                settle_reason = "domain_rejected"
                 cli_log(
                     f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: "
                     f"{redact_sensitive_log_line(str(exc))}"
@@ -4557,6 +5036,7 @@ def run_registration_cli(count):
                 mark_slot_completed()
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
+                settle_outcome = "retryable"
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
                         f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: "
@@ -4579,10 +5059,55 @@ def run_registration_cli(count):
                         log_callback=cli_log,
                     )
                     mark_slot_completed()
+            except ReusableResourceError as exc:
+                retry_count_for_slot += 1
+                settle_outcome = "retryable"
+                single_rotate_idx += 1
+                if retry_count_for_slot <= max_slot_retry:
+                    cli_log(
+                        f"[!] 协议收件前失败（未用邮箱/打码），重开浏览器或换出口 "
+                        f"{retry_count_for_slot}/{max_slot_retry}: "
+                        f"{redact_sensitive_log_line(str(exc))}"
+                    )
+                else:
+                    cli_log(
+                        f"[!] 协议收件前仍失败（未用邮箱/打码，不计失败）: "
+                        f"{redact_sensitive_log_line(str(exc))}"
+                    )
+                    retry_count_for_slot = 0
+                    i += 1
+                    mark_slot_completed()
             except Exception as exc:
+                if not should_count_as_failure(exc):
+                    retry_count_for_slot += 1
+                    settle_outcome = "retryable"
+                    single_rotate_idx += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        cli_log(
+                            f"[!] 资源可重用，同槽位重试 {retry_count_for_slot}/{max_slot_retry}: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                    else:
+                        cli_log(
+                            f"[!] 资源可重用，跳过且不计失败: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                        retry_count_for_slot = 0
+                        i += 1
+                        mark_slot_completed()
+                    continue
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
+                if kind in (FAIL_DOMAIN, FAIL_RISK, FAIL_CPA):
+                    settle_outcome = "dead"
+                    settle_reason = {
+                        FAIL_DOMAIN: "domain_rejected",
+                        FAIL_RISK: "guard_risk",
+                        FAIL_CPA: "register_ok",
+                    }[kind]
+                else:
+                    settle_outcome = "retryable"
                 message = str(exc)
                 proxy_dead = any(
                     marker in message
@@ -4625,6 +5150,13 @@ def run_registration_cli(count):
                         log_callback=cli_log,
                     )
                 mark_slot_completed()
+            finally:
+                outlook_rt_settle_attempt(
+                    email,
+                    outcome=settle_outcome,
+                    reason=settle_reason,
+                    log_callback=cli_log,
+                )
             if controller.should_stop():
                 break
             # 每轮结束只关浏览器，不立刻再开。
