@@ -36,6 +36,7 @@ def test_registration_risk_policy():
 
 def test_risk_gate_runs_when_cpa_auto_add_is_disabled():
     previous_auto_add = register.config.get("cpa_auto_add")
+    previous_sso_check = register.config.get("sso_check")
     previous_functions = (
         register._resolve_cpa_proxy,
         register._s2cpa.inspect_sso_account_state,
@@ -46,6 +47,7 @@ def test_risk_gate_runs_when_cpa_auto_add_is_disabled():
     quarantined = []
     recorded = []
     register.config["cpa_auto_add"] = False
+    register.config["sso_check"] = True
     register._resolve_cpa_proxy = lambda: ""
     register._s2cpa.inspect_sso_account_state = (
         lambda sso, **_kwargs: inspected.append(sso)
@@ -67,15 +69,10 @@ def test_risk_gate_runs_when_cpa_auto_add_is_disabled():
         lambda status, email, **kwargs: recorded.append((status, email, kwargs))
     )
     try:
-        try:
-            register.ensure_sso_oauth_eligible(
-                "sso=quarantined-token",
-                email="risk@example.test",
-            )
-        except register.RegistrationRiskDenied:
-            pass
-        else:
-            raise AssertionError("risk SSO was not blocked")
+        state = register.ensure_sso_oauth_eligible(
+            "sso=quarantined-token",
+            email="risk@example.test",
+        )
     finally:
         (
             register._resolve_cpa_proxy,
@@ -87,8 +84,13 @@ def test_risk_gate_runs_when_cpa_auto_add_is_disabled():
             register.config.pop("cpa_auto_add", None)
         else:
             register.config["cpa_auto_add"] = previous_auto_add
+        if previous_sso_check is None:
+            register.config.pop("sso_check", None)
+        else:
+            register.config["sso_check"] = previous_sso_check
 
     assert inspected == ["quarantined-token"]
+    assert state.get("bot_flag_source") == 2
     assert quarantined == [
         (
             "risk@example.test",
@@ -96,18 +98,17 @@ def test_risk_gate_runs_when_cpa_auto_add_is_disabled():
             "risk=0.95,policy=allow,event=$registration",
         )
     ]
-    assert len(recorded) == 1
-    assert recorded[0][0:2] == ("risk", "risk@example.test")
-    assert recorded[0][2]["kind"] == register.FAIL_RISK
 
 
 def test_unknown_state_continues_without_quarantine():
+    previous_sso_check = register.config.get("sso_check")
     previous_functions = (
         register._resolve_cpa_proxy,
         register._s2cpa.inspect_sso_account_state,
         register._append_sso_risk_rejected,
     )
     quarantined = []
+    register.config["sso_check"] = True
     register._resolve_cpa_proxy = lambda: ""
     register._s2cpa.inspect_sso_account_state = lambda *_args, **_kwargs: {
         "found": False,
@@ -125,13 +126,38 @@ def test_unknown_state_continues_without_quarantine():
             register._s2cpa.inspect_sso_account_state,
             register._append_sso_risk_rejected,
         ) = previous_functions
+        if previous_sso_check is None:
+            register.config.pop("sso_check", None)
+        else:
+            register.config["sso_check"] = previous_sso_check
 
     assert state["found"] is False
     assert quarantined == []
+
+
+def test_sso_check_off_skips_inspect():
+    previous_sso_check = register.config.get("sso_check")
+    inspected = []
+    previous = register._s2cpa.inspect_sso_account_state
+    register.config["sso_check"] = False
+    register._s2cpa.inspect_sso_account_state = (
+        lambda *_args, **_kwargs: inspected.append(True) or {"found": True}
+    )
+    try:
+        state = register.ensure_sso_oauth_eligible("sso=skip-me")
+    finally:
+        register._s2cpa.inspect_sso_account_state = previous
+        if previous_sso_check is None:
+            register.config.pop("sso_check", None)
+        else:
+            register.config["sso_check"] = previous_sso_check
+    assert state.get("skipped") is True
+    assert inspected == []
 
 
 if __name__ == "__main__":
     test_registration_risk_policy()
     test_risk_gate_runs_when_cpa_auto_add_is_disabled()
     test_unknown_state_continues_without_quarantine()
+    test_sso_check_off_skips_inspect()
     print("OK registration risk gate")

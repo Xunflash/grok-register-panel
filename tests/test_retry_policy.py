@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT))
 import connectivity
 import grok_register_ttk
 import retry_policy
+from browser_session import is_browser_pipe_error
 
 
 def test_defaults_are_bounded_and_overridable():
@@ -17,9 +18,26 @@ def test_defaults_are_bounded_and_overridable():
     assert retry_policy.proxy_boot_rotations({}) == 3
     assert retry_policy.slot_retries({}) == 1
     assert retry_policy.orchestrator_failure_limit({}) == 2
+    assert retry_policy.protocol_pre_inbox_retries({}) == 3
     assert retry_policy.browser_start_attempts({"GROK_BROWSER_START_ATTEMPTS": "99"}) == 4
     assert retry_policy.proxy_boot_rotations({"GROK_PROXY_BOOT_ROTATIONS": "-4"}) == 0
     assert retry_policy.slot_retries({"GROK_SLOT_RETRIES": "invalid"}) == 1
+    assert retry_policy.protocol_pre_inbox_retries({"GROK_PROTOCOL_PRE_INBOX_RETRIES": "99"}) == 8
+
+
+def test_reusable_resource_error_is_not_counted_until_spent():
+    err = retry_policy.ReusableResourceError("companion missing")
+    assert retry_policy.should_count_as_failure(err) is False
+    spent = retry_policy.ReusableResourceError("otp", email_used=True)
+    assert retry_policy.should_count_as_failure(spent) is True
+    cap = retry_policy.ReusableResourceError("paid", remote_captcha_used=True)
+    assert retry_policy.should_count_as_failure(cap) is True
+    assert retry_policy.should_count_as_failure(RuntimeError("other")) is True
+    reset = ConnectionResetError(104, "Connection reset by peer")
+    aborted = Exception("('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))")
+    assert is_browser_pipe_error(reset) is True
+    assert is_browser_pipe_error(aborted) is True
+    assert is_browser_pipe_error(RuntimeError("Turnstile 超时")) is False
 
 
 def test_xai_failure_is_explicitly_non_retryable():
@@ -58,6 +76,7 @@ def test_xai_precheck_failure_updates_managed_proxy_health():
 
 if __name__ == "__main__":
     test_defaults_are_bounded_and_overridable()
+    test_reusable_resource_error_is_not_counted_until_spent()
     test_xai_failure_is_explicitly_non_retryable()
     test_xai_precheck_failure_updates_managed_proxy_health()
     print("OK retry policy")

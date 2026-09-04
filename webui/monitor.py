@@ -60,6 +60,7 @@ try:
         write_pid_file,
     )
     from webui.recovery_ops import recovery_status, start_recovery, stop_recovery
+    from resin_sticky import resin_sync_status, start_resin_sync
     from webui.bfs_ops import bfs_status, check_token_text, run_bfs_scan
     from webui.sso_state_ops import (
         read_sso_state_export,
@@ -103,6 +104,7 @@ except ImportError:  # running as script from webui/
         write_pid_file,
     )
     from recovery_ops import recovery_status, start_recovery, stop_recovery  # type: ignore
+    from resin_sticky import resin_sync_status, start_resin_sync  # type: ignore
     from bfs_ops import bfs_status, check_token_text, run_bfs_scan  # type: ignore
     from sso_state_ops import (  # type: ignore
         read_sso_state_export,
@@ -224,6 +226,8 @@ def load_control() -> dict:
         c.setdefault("batch_count", 40)
         c.setdefault("add_count", 40)  # 再跑 N 个
         c.setdefault("mode", "orch")  # orch | batch
+        c.setdefault("turnstile_provider", "yescaptcha")
+        c.setdefault("registration_scheme", "browser")
         return c
 
 
@@ -236,6 +240,8 @@ def save_control(updates: dict) -> dict:
         "mode",
         "base_cpa",
         "target_cpa",
+        "turnstile_provider",
+        "registration_scheme",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -257,6 +263,30 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["add_count"] = 40
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
+        provider = str(c.get("turnstile_provider") or "yescaptcha").strip().lower()
+        if provider in {"yes", "cloud", "云", "云打码"}:
+            provider = "yescaptcha"
+        if provider in {"cap", "capsolver", "capsolver.com"}:
+            provider = "capsolver"
+        if provider in {"solver", "camoufox", "click", "本地", "本地打码", "本地点击"}:
+            provider = "local"
+        c["turnstile_provider"] = (
+            provider if provider in {"local", "yescaptcha", "capsolver"} else "yescaptcha"
+        )
+        try:
+            from turnstile_solver import persist_turnstile_provider
+
+            persist_turnstile_provider(c["turnstile_provider"], ROOT / "config.json")
+        except Exception:
+            pass
+        from signup_scheme import persist_registration_scheme, resolve_registration_scheme
+
+        scheme = resolve_registration_scheme(c.get("registration_scheme") or "browser")
+        c["registration_scheme"] = scheme
+        try:
+            persist_registration_scheme(scheme, ROOT / "config.json")
+        except Exception:
+            pass
         for key in ("base_cpa", "target_cpa"):
             if c.get(key) is None or str(c.get(key)).strip() == "":
                 c.pop(key, None)
@@ -696,6 +726,64 @@ def _registration_env() -> dict[str, str]:
     if os.name == "nt":
         env.setdefault("GROK_HEADLESS", "1")
         env.setdefault("PYTHONUTF8", "1")
+    try:
+        from turnstile_solver import load_turnstile_settings, resolve_turnstile_provider
+
+        control = load_control()
+        ts = load_turnstile_settings(control=control, config_path=ROOT / "config.json")
+        # 面板下拉优先于 monitor 进程环境，切本地不必删 key
+        env["TURNSTILE_PROVIDER"] = resolve_turnstile_provider(
+            str(control.get("turnstile_provider") or ts.get("setting") or "local"),
+            yescaptcha_key=str(ts.get("yescaptcha_key") or ""),
+            capsolver_key=str(ts.get("capsolver_key") or ""),
+        )
+        yes_key = str(ts.get("yescaptcha_key") or "").strip()
+        if not yes_key and ts.get("provider") != "capsolver":
+            yes_key = str(ts.get("key") or "").strip()
+        if yes_key:
+            env["YESCAPTCHA_KEY"] = yes_key
+        yes_api = str(ts.get("yescaptcha_api") or "").strip()
+        if yes_api:
+            env["YESCAPTCHA_API"] = yes_api
+        elif ts.get("api") and ts.get("provider") != "capsolver":
+            env["YESCAPTCHA_API"] = str(ts["api"])
+        cap_key = str(ts.get("capsolver_key") or "").strip()
+        if cap_key:
+            env["CAPSOLVER_KEY"] = cap_key
+        cap_api = str(ts.get("capsolver_api") or "").strip()
+        if cap_api:
+            env["CAPSOLVER_API"] = cap_api
+        elif ts.get("provider") == "capsolver" and ts.get("api"):
+            env["CAPSOLVER_API"] = str(ts["api"])
+        env["TURNSTILE_FALLBACK_LOCAL"] = "1" if ts.get("fallback_local") else "0"
+    except Exception:
+        pass
+    try:
+        from signup_scheme import ENV_NAME, SCHEME_PROTOCOL, resolve_registration_scheme
+
+        control = load_control()
+        scheme = resolve_registration_scheme(
+            control.get("registration_scheme") or "browser"
+        )
+        env[ENV_NAME] = scheme
+        if scheme == SCHEME_PROTOCOL:
+            env["GROK_FP_ENHANCE"] = "0"
+        debug_mode = False
+        try:
+            cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8") or "{}")
+            debug_mode = bool(cfg.get("debug_mode")) if isinstance(cfg, dict) else False
+        except Exception:
+            debug_mode = False
+        if debug_mode:
+            env["GROK_DEBUG_MODE"] = "1"
+            har_dir = str(LOG_DIR / "browser-hars")
+            Path(har_dir).mkdir(parents=True, exist_ok=True)
+            env.setdefault("GROK_RECORD_HAR_DIR", har_dir)
+        else:
+            env.pop("GROK_RECORD_HAR_DIR", None)
+            env.pop("GROK_DEBUG_MODE", None)
+    except Exception:
+        pass
     apply_playwright_node_env(env)
     return env
 
@@ -739,7 +827,9 @@ def _start_orch_unlocked():
     stdout = os.fdopen(fd, "a", encoding="utf-8")
     stdout.write(
         f"\n--- monitor start {time.strftime('%Y-%m-%dT%H:%M:%SZ')} "
-        f"workers={c.get('workers')} cpa={now} target={c.get('target_cpa')} need={need} ---\n"
+        f"workers={c.get('workers')} captcha={c.get('turnstile_provider')} "
+        f"scheme={c.get('registration_scheme')} "
+        f"cpa={now} target={c.get('target_cpa')} need={need} ---\n"
     )
     stdout.flush()
     try:
@@ -1388,6 +1478,8 @@ HTML = r"""<!DOCTYPE html>
   }
   .proxy-import-actions { display: flex; flex-direction: column; justify-content: space-between; gap: 12px; }
   .proxy-import-actions .button-group { justify-content: flex-start; }
+  .proxy-resin-target { width: 140px; }
+  .proxy-resin-target input { width: 100%; }
   .proxy-format { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
   .proxy-list-section { margin-top: 18px; }
   .proxy-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
@@ -2026,6 +2118,21 @@ HTML = r"""<!DOCTYPE html>
       <div class="field"><label for="workers-input">并发数</label>
         <input type="number" id="workers-input" min="1" max="24" value="3"/>
       </div>
+      <div class="field">
+        <label for="turnstile_provider">打码方式</label>
+        <select id="turnstile_provider" title="Capsolver / YesCaptcha=云打码回填；本地点击=Camoufox 点 Turnstile。密钥写在 config.json，切换不必删除 key。">
+          <option value="capsolver">Capsolver 云打码</option>
+          <option value="yescaptcha">YesCaptcha 云打码</option>
+          <option value="local">本地点击</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="registration_scheme">注册方案</label>
+        <select id="registration_scheme" title="浏览器注册=Camoufox 表单点击；协议注册=HAR 回放发码/建号，Turnstile 仍走云打码。">
+          <option value="browser">浏览器注册</option>
+          <option value="protocol">协议注册</option>
+        </select>
+      </div>
       <div class="field"><label for="batch_count">单批数量</label>
         <input type="number" id="batch_count" min="1" max="200" value="40"/>
       </div>
@@ -2179,8 +2286,13 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div class="proxy-import-actions">
           <p class="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
+          <div class="field proxy-resin-target">
+            <label for="proxy-resin-target-input">Resin sticky 数量</label>
+            <input id="proxy-resin-target-input" type="number" min="1" step="1" value="128" inputmode="numeric" autocomplete="off" />
+          </div>
           <div class="button-group">
             <button class="primary" id="proxy-import-button" onclick="importProxyInput()">导入代理</button>
+            <button id="proxy-resin-button" onclick="syncResinStickies()">同步 Resin sticky</button>
             <button id="proxy-legacy-button" onclick="importLegacyProxies()">导入 proxies.txt</button>
           </div>
         </div>
@@ -2828,6 +2940,18 @@ function renderProxyPool(data) {
   const legacyButton = document.getElementById("proxy-legacy-button");
   legacyButton.disabled = !legacy.available;
   legacyButton.textContent = legacy.available ? ("导入 proxies.txt (" + (legacy.count || 0) + ")") : "无 proxies.txt";
+  const resinSync = proxyData.resin_sync || {};
+  const resinButton = document.getElementById("proxy-resin-button");
+  if (resinButton) {
+    resinButton.disabled = !!resinSync.running;
+    resinButton.textContent = resinSync.running
+      ? ("同步 Resin " + (resinSync.mapped || 0) + "/" + (resinSync.target || 0))
+      : "同步 Resin sticky";
+  }
+  const resinTargetInput = document.getElementById("proxy-resin-target-input");
+  if (resinTargetInput && Number(resinSync.target || 0) > 0 && document.activeElement !== resinTargetInput) {
+    resinTargetInput.value = resinSync.target;
+  }
 
   const job = proxyData.test_job || {};
   const testButton = document.getElementById("proxy-test-all");
@@ -2847,9 +2971,10 @@ function renderProxyPool(data) {
     const cooldown = cooldownText(item);
     const detail = cooldown || item.last_error || (item.last_checked_at ? ("检测 " + proxyTime(item.last_checked_at)) : "尚未检测");
     const count = (item.failure_count || 0) > 0 ? `<div class="proxy-meta">失败 ${esc(item.failure_count)} / 风控 ${esc(item.risk_count || 0)}</div>` : "";
+    const label = item.label ? `<div class="proxy-meta">${esc(item.label)}</div>` : "";
     return `<tr>
       <td><span class="proxy-state ${stateClass}">${esc(proxyStatusLabel(status))}</span></td>
-      <td><div class="mono proxy-endpoint">${esc(item.display_url || "")}</div><div class="proxy-meta">${item.has_auth ? "凭据已隐藏" : "无鉴权"} / ${esc(item.source || "panel")}</div></td>
+      <td><div class="mono proxy-endpoint">${esc(item.display_url || "")}</div>${label}<div class="proxy-meta">${item.has_auth ? "凭据已隐藏" : "无鉴权"} / ${esc(item.source || "panel")}</div></td>
       <td><div class="mono">${exit}</div><div class="proxy-meta mono">${asn}</div>${org}</td>
       <td class="mono">${latency}</td>
       <td title="${esc(item.last_error || "")}">${esc(detail)}${count}</td>
@@ -2894,6 +3019,25 @@ async function importProxyInput() {
     const testing = await startImportedProxyTests(result);
     setMsg("proxy-msg", proxyImportMessage(result, "已导入 ") + (testing ? "，已开始检测" : ""), result.errors && result.errors.length ? "" : "ok");
     setTimeout(() => refreshProxies(false), 300);
+  } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function syncResinStickies() {
+  const button = document.getElementById("proxy-resin-button");
+  const targetInput = document.getElementById("proxy-resin-target-input");
+  const rawTarget = (targetInput.value || "").trim();
+  if (!/^[1-9]\d*$/.test(rawTarget)) {
+    setMsg("proxy-msg", "Resin sticky 数量请输入大于 0 的整数", "err");
+    targetInput.focus();
+    return;
+  }
+  const target = rawTarget;
+  button.disabled = true;
+  setMsg("proxy-msg", "正在按节点展开 Resin sticky（目标 " + target + "，探测租约，去重 1 节点 1 条）…", "");
+  try {
+    await api("/api/proxies/resin-sync", { method: "POST", body: JSON.stringify({ target }) });
+    setMsg("proxy-msg", "Resin 同步已启动，目标 " + target + " 条，完成后列表会变成每节点一条 sticky", "ok");
+    await refreshProxies(false);
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
@@ -3220,12 +3364,18 @@ async function refresh() {
 }
 function fillControl(d) {
   const c = d.control || {};
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode"].includes(document.activeElement.id)) return;
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) return;
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
   if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
   if (c.mode) document.getElementById("mode").value = c.mode;
+  if (c.turnstile_provider && document.getElementById("turnstile_provider")) {
+    document.getElementById("turnstile_provider").value = c.turnstile_provider;
+  }
+  if (c.registration_scheme && document.getElementById("registration_scheme")) {
+    document.getElementById("registration_scheme").value = c.registration_scheme;
+  }
 }
 function controlBody() {
   return {
@@ -3234,12 +3384,14 @@ function controlBody() {
     add_count: Number((document.getElementById("add_count") || {}).value || 40),
     risk_pause: Number(document.getElementById("risk_pause").value || 10),
     mode: document.getElementById("mode").value || "orch",
+    turnstile_provider: (document.getElementById("turnstile_provider") || {}).value || "capsolver",
+    registration_scheme: (document.getElementById("registration_scheme") || {}).value || "browser",
   };
 }
 async function saveCtrl() {
   try {
     const j = await api("/api/control", { method: "POST", body: JSON.stringify(controlBody()) });
-    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers, "ok");
+    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，方案 " + (j.registration_scheme || ""), "ok");
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
 }
 async function doStart() {
@@ -3959,7 +4111,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/proxies":
             try:
-                self._json(200, read_proxy_pool())
+                data = read_proxy_pool()
+                data["resin_sync"] = resin_sync_status()
+                self._json(200, data)
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4073,6 +4227,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if result.get("ok") else 404, result)
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/proxies/resin-sync":
+            try:
+                result = start_resin_sync(target=(body or {}).get("target"))
+                code = 202 if result.get("ok") else (409 if result.get("running") else 400)
+                self._json(code, result)
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/proxies/import":
             try:

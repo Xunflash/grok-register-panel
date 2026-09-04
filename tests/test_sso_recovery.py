@@ -133,6 +133,35 @@ def test_bfs_config_defaults_are_loaded_for_cli():
         assert args.grok2api_auth_dir == str((Path(temp) / "g2a").resolve())
 
 
+def test_bfs_check_defaults_off_without_config():
+    args = SimpleNamespace(
+        from_config=None,
+        prefer=None,
+        bfs_check=None,
+        bfs_skip_write=None,
+        bfs_disable=None,
+    )
+    apply_config_defaults(args)
+    assert args.bfs_check is False
+    with tempfile.TemporaryDirectory() as temp:
+        config = Path(temp) / "config.json"
+        config.write_text("{}", encoding="utf-8")
+        loaded = SimpleNamespace(
+            from_config=str(config),
+            cpa_auth_dir=None,
+            grok2api_auth_dir=None,
+            cpa_remote_url=None,
+            cpa_management_key=None,
+            proxy="",
+            prefer=None,
+            bfs_check=None,
+            bfs_skip_write=None,
+            bfs_disable=None,
+        )
+        apply_config_defaults(loaded)
+        assert loaded.bfs_check is False
+
+
 if __name__ == "__main__":
     test_parser_preserves_email_and_password()
     test_queue_dedup_and_consume()
@@ -140,4 +169,5 @@ if __name__ == "__main__":
     test_cpa_only_batch_does_not_create_auth_out()
     test_existing_cpa_email_detection()
     test_bfs_config_defaults_are_loaded_for_cli()
+    test_bfs_check_defaults_off_without_config()
     print("OK sso recovery")

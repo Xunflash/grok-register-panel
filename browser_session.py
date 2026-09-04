@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import ipaddress
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -74,6 +75,12 @@ _FP_PROBE_JS = """() => {
     vendor: '',
     renderer: '',
     fontsWin: false,
+    tz: '',
+    langs: '',
+    hw: 0,
+    screenW: 0,
+    screenH: 0,
+    availH: 0,
   };
   try {
     const c = document.createElement('canvas');
@@ -93,8 +100,200 @@ _FP_PROBE_JS = """() => {
       document.fonts.check('12px "Segoe UI Historic"')
     ));
   } catch (e) {}
+  try {
+    out.tz = String((Intl.DateTimeFormat().resolvedOptions() || {}).timeZone || '');
+  } catch (e) {}
+  try {
+    out.langs = Array.from(navigator.languages || []).join(',');
+  } catch (e) {}
+  try {
+    out.hw = Number(navigator.hardwareConcurrency || 0);
+    out.screenW = Number((screen && screen.width) || 0);
+    out.screenH = Number((screen && screen.height) || 0);
+    out.availH = Number((screen && screen.availHeight) || 0);
+  } catch (e) {}
   return out;
 }"""
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def fingerprint_enhance_enabled() -> bool:
+    """GROK_FP_ENHANCE=0 关闭本次指纹启动项，回到 locale=en-US / 不约束 screen / 不指定 webgl。"""
+    return _env_flag("GROK_FP_ENHANCE", True)
+
+
+_WEBGL_PAIRS_CACHE: dict = {}
+_SKIP_RENDERER_SUBSTR = ("gtx 980", "swiftshader", "basic render driver")
+
+
+def _pick_webgl_config(browser_os: str) -> Optional[Tuple[str, str]]:
+    """从 Camoufox WebGL 池均匀抽样，避开日志扎堆的 GTX 980 和软件渲染器。"""
+    os_key = {"windows": "win", "macos": "mac", "linux": "lin"}.get(browser_os, "win")
+    try:
+        pairs = _WEBGL_PAIRS_CACHE.get(os_key)
+        if pairs is None:
+            from camoufox.webgl.sample import get_possible_pairs
+
+            pairs = list(get_possible_pairs().get(os_key) or [])
+            _WEBGL_PAIRS_CACHE[os_key] = pairs
+    except Exception:
+        return None
+    if not pairs:
+        return None
+    import random
+
+    preferred = [
+        (str(vendor), str(renderer))
+        for vendor, renderer in pairs
+        if vendor
+        and renderer
+        and not any(skip in str(renderer).lower() for skip in _SKIP_RENDERER_SUBSTR)
+    ]
+    pool = preferred or [(str(v), str(r)) for v, r in pairs if v and r]
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+def _xvfb_screen_constraint():
+    """指纹屏幕不超过当前 Xvfb 1920x1080，避免 screen 大于真实窗口。"""
+    try:
+        from browserforge.fingerprints import Screen
+    except Exception:
+        return None
+    return Screen(min_width=1280, max_width=1920, min_height=720, max_height=1080)
+
+
+def parse_screen_spec(raw: object) -> Optional[Tuple[int, int]]:
+    """Parse '1920x1080' / '1920X1080'. Invalid values return None."""
+    text = str(raw or "").strip().lower().replace(" ", "")
+    if "x" not in text:
+        return None
+    left, right = text.split("x", 1)
+    try:
+        width, height = int(left), int(right)
+    except (TypeError, ValueError):
+        return None
+    if width < 800 or height < 600 or width > 7680 or height > 4320:
+        return None
+    return width, height
+
+
+def fp_timezone_override() -> str:
+    """GROK_FP_TIMEZONE=America/Sao_Paulo pins IANA tz; empty keeps geoip tz."""
+    return str(os.environ.get("GROK_FP_TIMEZONE") or "").strip()
+
+
+def fp_screen_choices() -> list:
+    """GROK_FP_SCREENS=1920x1080,2560x1440 (or GROK_FP_SCREEN= one size)."""
+    raw = str(os.environ.get("GROK_FP_SCREENS") or os.environ.get("GROK_FP_SCREEN") or "").strip()
+    if not raw:
+        return []
+    out = []
+    seen = set()
+    for part in raw.split(","):
+        spec = parse_screen_spec(part)
+        if spec and spec not in seen:
+            seen.add(spec)
+            out.append(spec)
+    return out
+
+
+_fp_screen_seq = 0
+_fp_screen_seq_lock = threading.Lock()
+
+
+def pick_fp_screen() -> Optional[Tuple[int, int]]:
+    """Round-robin 1080p / 2K so a short test actually covers both sizes."""
+    global _fp_screen_seq
+    choices = fp_screen_choices()
+    if not choices:
+        return None
+    with _fp_screen_seq_lock:
+        idx = _fp_screen_seq
+        _fp_screen_seq += 1
+    return choices[idx % len(choices)]
+
+
+def set_proxy_rotate_hook(fn: Optional[Callable] = None) -> None:
+    """Optional hook start_browser calls after an allowlist/blacklist miss."""
+    _tls.proxy_rotate = fn
+
+
+def try_rotate_proxy(reason: str = "", log_callback=None) -> bool:
+    """Call the worker's proxy-rotate hook if one is registered."""
+    return _invoke_proxy_rotate(reason or "rotate", log_callback)
+
+
+def _invoke_proxy_rotate(reason: str, log_callback=None) -> bool:
+    hook = getattr(_tls, "proxy_rotate", None)
+    if not callable(hook):
+        return False
+    try:
+        hook(reason)
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 换 sticky 失败: {redact_log_line(str(exc))}")
+        return False
+
+
+def _screen_from_wh(width: int, height: int):
+    try:
+        from browserforge.fingerprints import Screen
+    except Exception:
+        return None
+    return Screen(min_width=width, max_width=width, min_height=height, max_height=height)
+
+
+def exit_ip_prefixes() -> list:
+    """GROK_EXIT_IP_PREFIXES=104.207,209.50 or 104.207.0.0/16. Empty = no filter."""
+    raw = str(os.environ.get("GROK_EXIT_IP_PREFIXES") or "").strip()
+    if not raw:
+        return []
+    out = []
+    seen = set()
+    for part in raw.split(","):
+        token = str(part or "").strip()
+        if not token:
+            continue
+        if "/" in token:
+            token = token.split("/", 1)[0].strip()
+        bits = [b for b in token.split(".") if b != ""]
+        if not bits:
+            continue
+        # Drop trailing .0 octets from CIDR network addresses: 104.207.0.0 -> 104.207
+        while len(bits) > 1 and bits[-1] == "0":
+            bits.pop()
+        prefix = ".".join(bits) + "."
+        if prefix not in seen:
+            seen.add(prefix)
+            out.append(prefix)
+    return out
+
+
+def exit_ip_allowed(ip: str) -> bool:
+    """True if no allowlist, or IPv4 starts with an allowed prefix."""
+    prefixes = exit_ip_prefixes()
+    if not prefixes:
+        return True
+    value = str(ip or "").strip()
+    if not value:
+        return False
+    try:
+        packed = ipaddress.ip_address(value)
+    except Exception:
+        return False
+    if packed.version != 4:
+        return False
+    dotted = str(packed) + "."
+    return any(dotted.startswith(prefix) for prefix in prefixes)
 
 
 def resolve_browser_os(raw: Optional[str] = None) -> str:
@@ -123,11 +322,27 @@ def format_fingerprint_log(os_name: str, probe: Optional[dict] = None) -> str:
         leak.append("no-webgl")
     if probe.get("fontsWin") is False:
         leak.append("no-segoe")
+    try:
+        sw = int(probe.get("screenW") or 0)
+        sh = int(probe.get("screenH") or 0)
+    except (TypeError, ValueError):
+        sw, sh = 0, 0
+    if sw > 1920 or sh > 1080:
+        leak.append("screen>xvfb")
     leak_s = f" leak={','.join(leak)}" if leak else " leak=none"
+    extra = ""
+    tz = str(probe.get("tz") or "").strip()
+    langs = str(probe.get("langs") or "").strip()
+    hw = probe.get("hw")
+    if tz or langs or hw or sw:
+        extra = (
+            f" tz={tz or '?'} langs={langs or '?'} hw={hw or '?'} "
+            f"screen={sw or '?'}x{sh or '?'}"
+        )
     return (
         f"[*] 指纹 os={os_name} platform={plat} "
         f"webgl={renderer} fontsWin={probe.get('fontsWin')} "
-        f"ua={ua_short}{leak_s}"
+        f"ua={ua_short}{extra}{leak_s}"
     )
 
 
@@ -212,6 +427,10 @@ _extension_path: str = ""
 _start_fail_lock = threading.Lock()
 _start_fail_streak = 0
 _start_fail_threshold = 3
+_har_prune_lock = threading.Lock()
+_har_pruned_dirs: set[str] = set()
+_EMPTY_HAR_MAX_BYTES = 512
+_SESSION_HAR_NAME = re.compile(r"^\d+-\d+-[0-9a-f]{8}\.har$", re.I)
 
 
 def configure(get_proxies=None, is_debug=None, extension_path=""):
@@ -221,13 +440,15 @@ def configure(get_proxies=None, is_debug=None, extension_path=""):
     _extension_path = extension_path or ""
 
 
-def _is_driver_pipe_error(exc: object) -> bool:
-    """Playwright Node 管道断开 / 浏览器已关。"""
+def is_browser_pipe_error(exc: object) -> bool:
+    """Playwright Node 管道断开、对端复位、或浏览器已关。"""
     msg = str(exc or "")
     low = msg.lower()
     return (
         "epipe" in low
         or "econnreset" in low
+        or "connection reset" in low
+        or "connection aborted" in low
         or "target closed" in low
         or "targetclosed" in low
         or "browser has been closed" in low
@@ -235,6 +456,10 @@ def _is_driver_pipe_error(exc: object) -> bool:
         or "pipe closed" in low
         or "playwright connection" in low
     )
+
+
+def _is_driver_pipe_error(exc: object) -> bool:
+    return is_browser_pipe_error(exc)
 
 
 def get_start_fail_streak() -> int:
@@ -389,8 +614,45 @@ def lookup_exit_meta(ip: str) -> dict:
     return info
 
 
+_guard_ip_block = {}
+_guard_ip_block_lock = __import__("threading").Lock()
+
+
+def block_exit_ip(ip: str, seconds: object = 1800, reason: str = "") -> float:
+    """Temporarily skip this residential exit IP after Guard risk."""
+    value = str(ip or "").strip()
+    if not value:
+        return 0.0
+    try:
+        ttl = max(60, int(seconds or 0) or 1800)
+    except (TypeError, ValueError):
+        ttl = 1800
+    until = __import__("time").time() + ttl
+    with _guard_ip_block_lock:
+        prev = float(_guard_ip_block.get(value) or 0)
+        _guard_ip_block[value] = max(prev, until)
+    return until
+
+
+def is_guard_blocked_exit_ip(ip: str) -> tuple:
+    value = str(ip or "").strip()
+    if not value:
+        return False, 0.0
+    now = __import__("time").time()
+    with _guard_ip_block_lock:
+        until = float(_guard_ip_block.get(value) or 0)
+        if until <= now:
+            _guard_ip_block.pop(value, None)
+            return False, 0.0
+        return True, until
+
+
 def is_blocked_exit_ip(ip: str) -> tuple:
     """若应跳过该出口，返回 (True, reason)；否则 (False, meta摘要)."""
+    blocked_ip, until = is_guard_blocked_exit_ip(ip)
+    if blocked_ip:
+        remain = max(0, int(until - __import__("time").time()))
+        return True, f"guard-block {remain}s"
     info = lookup_exit_meta(ip)
     asn = str(info.get("as") or "")
     asn_num = info.get("asn")
@@ -409,7 +671,7 @@ def is_blocked_exit_ip(ip: str) -> tuple:
     blocked_asns = set(state.get("asns") or _BLOCKED_ASN_NUMS)
     blocked_asn_labels = tuple(f"AS{value}" for value in blocked_asns)
     blocked_isp_keywords = tuple(state.get("isp_keywords") or _BLOCKED_ISP_SUBSTR)
-    # 家宽只换 IP，不因 ASN/ISP 整段跳过
+    # 家宽只换 IP，不因 ASN/ISP 整段跳过；Guard 风控后按 TTL 跳过该 IP
     summary = f"{asn or '?'} | {isp or '?'} | {info.get('city') or '?'}"
     return False, summary
 
@@ -755,6 +1017,166 @@ def _detect_ff_version() -> str:
         return ""
 
 
+def _broken_default_addons():
+    """Return Camoufox default addons whose extract dir has no manifest.json."""
+    try:
+        from camoufox.addons import DefaultAddons, get_addon_path
+    except Exception:
+        return []
+    broken = []
+    for addon in DefaultAddons:
+        try:
+            path = get_addon_path(addon.name)
+        except Exception:
+            continue
+        if os.path.isdir(path) and not os.path.isfile(os.path.join(path, "manifest.json")):
+            broken.append(addon)
+    return broken
+
+
+
+def har_recording_enabled() -> bool:
+    """HAR is recorded only in debug mode, or when GROK_RECORD_HAR is set."""
+    if str(os.environ.get("GROK_RECORD_HAR") or "").strip():
+        return True
+    env = str(os.environ.get("GROK_DEBUG_MODE") or "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    return _debug()
+
+
+def prune_record_har_dir(directory: str | os.PathLike[str] | None) -> dict:
+    """Drop empty Playwright shells and leftover session HARs; keep captures."""
+    dest = Path(str(directory or "")).expanduser()
+    removed = 0
+    kept = 0
+    bytes_freed = 0
+    if not str(dest) or not dest.is_dir():
+        return {"removed": removed, "kept": kept, "bytes": bytes_freed}
+    for path in dest.glob("*.har"):
+        name = path.name
+        try:
+            size = int(path.stat().st_size)
+        except OSError:
+            continue
+        keep = name.startswith("success-") or name.startswith("signup-protocol")
+        if not keep and size > _EMPTY_HAR_MAX_BYTES and not _SESSION_HAR_NAME.match(name):
+            keep = True
+        if keep:
+            kept += 1
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed += 1
+        bytes_freed += max(size, 0)
+    return {"removed": removed, "kept": kept, "bytes": bytes_freed}
+
+
+def prune_default_har_dirs(force: bool = False) -> dict:
+    """Prune the default HAR dir once per process (plus GROK_RECORD_HAR_DIR)."""
+    dirs = [str(Path(__file__).resolve().parent / "log" / "browser-hars")]
+    extra = str(os.environ.get("GROK_RECORD_HAR_DIR") or "").strip()
+    if extra:
+        dirs.append(extra)
+    summary = {"removed": 0, "kept": 0, "bytes": 0}
+    for directory in dirs:
+        key = str(Path(directory))
+        with _har_prune_lock:
+            if not force and key in _har_pruned_dirs:
+                continue
+            _har_pruned_dirs.add(key)
+        stats = prune_record_har_dir(directory)
+        summary["removed"] += int(stats.get("removed") or 0)
+        summary["kept"] += int(stats.get("kept") or 0)
+        summary["bytes"] += int(stats.get("bytes") or 0)
+    return summary
+
+
+def resolve_record_har_path() -> str:
+    """Return the Playwright record_har_path for this browser start.
+
+    Recording is off unless debug_mode / GROK_DEBUG_MODE is on, or the
+    capture tool set GROK_RECORD_HAR. GROK_RECORD_HAR_DIR (preferred) or a
+    directory GROK_RECORD_HAR yields a unique *.har per start so concurrent
+    workers do not clobber each other. A *.har file path is used as-is.
+    """
+    explicit = str(os.environ.get("GROK_RECORD_HAR") or "").strip()
+    directory = str(os.environ.get("GROK_RECORD_HAR_DIR") or "").strip()
+    path = ""
+    if not har_recording_enabled():
+        _tls.record_har_path = ""
+        _tls.record_har_success_email = ""
+        _tls.record_har_saved = ""
+        return ""
+    explicit_file = (
+        explicit.endswith(".har") or Path(explicit).suffix.lower() == ".har"
+        if explicit
+        else False
+    )
+    if explicit_file:
+        candidate = Path(explicit)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        path = str(candidate)
+    elif directory:
+        dest_dir = Path(directory)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        prune_record_har_dir(dest_dir)
+        path = str(
+            dest_dir
+            / f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.har"
+        )
+    elif explicit:
+        candidate = Path(explicit)
+        candidate.mkdir(parents=True, exist_ok=True)
+        prune_record_har_dir(candidate)
+        path = str(
+            candidate
+            / f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.har"
+        )
+    else:
+        dest_dir = Path(__file__).resolve().parent / "log" / "browser-hars"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        prune_record_har_dir(dest_dir)
+        path = str(
+            dest_dir
+            / f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.har"
+        )
+    _tls.record_har_path = path
+    _tls.record_har_success_email = ""
+    _tls.record_har_saved = ""
+    return path
+
+
+def current_record_har_path() -> str:
+    return str(getattr(_tls, "record_har_path", "") or "")
+
+
+def mark_recorded_har_success(email: str) -> None:
+    _tls.record_har_success_email = str(email or "").strip()
+
+
+def last_saved_success_har() -> str:
+    return str(getattr(_tls, "record_har_saved", "") or "")
+
+
+def _persist_success_har(har_path: str, email: str) -> str:
+    src = Path(har_path)
+    if not src.is_file() or src.stat().st_size <= 0:
+        return ""
+    dest_dir = Path(
+        str(os.environ.get("GROK_RECORD_HAR_DIR") or src.parent)
+    )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "._@+-" else "_" for ch in email)
+    dest = dest_dir / f"success-{safe}.har"
+    shutil.copy2(src, dest)
+    return str(dest)
+
+
 def create_browser_options(unique_profile=True) -> dict:
     """构建 Camoufox 启动参数 dict。
 
@@ -763,12 +1185,14 @@ def create_browser_options(unique_profile=True) -> dict:
 
     反检测策略：
     - headless=False：有头模式（headless 更易被检测）
-    - humanize=True：人类化鼠标移动 + 点击轨迹
+    - humanize=True：人类化鼠标移动 + 点击轨迹（不改时长，不改点击路径）
     - geoip=True：基于代理 IP 匹配时区 / 语言 / 经纬度
     - block_webrtc=True：WebRTC IP 泄漏防护（避免真实 IP 通过 STUN 暴露）
     - os=windows：UA / Client Hints / 字体 / WebGL 渲染器按 Windows 配置文件对齐
       （宿主机即使是 Linux Xvfb 也不走 linux 指纹）
     - 指纹由 BrowserForge 自动生成（匹配 Firefox/Camoufox 引擎）
+    - 不设置 disable_coop：会改 COOP，影响 Turnstile iframe 点击
+    - GROK_FP_ENHANCE=0 回滚：locale=en-US / 不约束 screen / 不指定 webgl_config
     """
     # GROK_HEADLESS=1 forces headless (needed on some Windows sessions where
     # headed Camoufox dies with GPU process / SW-WR framebuffer crashes).
@@ -779,16 +1203,19 @@ def create_browser_options(unique_profile=True) -> dict:
     force_headed = headed_env in {"1", "true", "yes", "on"}
     use_headless = bool(force_headless) and not force_headed
     browser_os = resolve_browser_os()
+    enhance = fingerprint_enhance_enabled()
 
     opts: dict = {
         "headless": use_headless,  # default headed; set GROK_HEADLESS=1 on broken GPU sessions
-        "humanize": True,       # 人类化鼠标移动 + 贝塞尔轨迹
+        "humanize": True,       # 人类化鼠标移动 + 贝塞尔轨迹；时长保持默认
         "geoip": True,          # 基于 IP 匹配时区 / 语言 / 经纬度
-        "locale": "en-US",      # 与美西出口一致，避免 UI 语言漂移
         "block_webrtc": True,   # 防止 WebRTC 泄漏真实 IP（即使使用代理）
         "os": browser_os,       # Windows 配置文件：UA + hints + 字体 + WebGL
         "i_know_what_im_doing": True,  # 抑制 Firefox 版本伪装警告（Camoufox 引擎层伪装是预期行为）
     }
+    if not enhance:
+        # 回滚：保持历史硬编码 locale，避免 geoip 改 UI 语言
+        opts["locale"] = "en-US"
     if use_headless or os.name == "nt":
         # Soften GPU requirements on Windows (headed or headless).
         opts["firefox_user_prefs"] = {
@@ -823,7 +1250,15 @@ def create_browser_options(unique_profile=True) -> dict:
                 raise RuntimeError(
                     f"出口IP命中黑名单，将换 sticky: ip={exit_ip} {meta}"
                 )
+            if not exit_ip_allowed(exit_ip):
+                set_exit_context(proxy=proxy, exit_ip=exit_ip)
+                raise RuntimeError(
+                    f"出口IP命中黑名单，将换 sticky: ip={exit_ip} "
+                    f"not-in-allow {','.join(exit_ip_prefixes())}"
+                )
             opts["geoip"] = exit_ip
+            # enhance：不传 locale，Camoufox 用 geoip 填 timezone/language。
+            # 回滚：上面已写死 en-US；handle_locales 会覆盖 geoip 的 locale。
             set_exit_context(proxy=proxy, exit_ip=exit_ip)
             # 把 ISP 摘要挂到 tls 方便结果日志
             try:
@@ -840,10 +1275,39 @@ def create_browser_options(unique_profile=True) -> dict:
             ) from ip_exc
     else:
         set_exit_context(proxy="", exit_ip="")
+        opts.setdefault("locale", "en-US")
+
+    pinned = pick_fp_screen()
+    if pinned:
+        screen = _screen_from_wh(pinned[0], pinned[1])
+        if screen is not None:
+            opts["screen"] = screen
+        # 2K 指纹时窗口仍限制在当前 Xvfb 1920x1080 内，避免画不出来。
+        if pinned[0] > 1920 or pinned[1] > 1080:
+            opts["window"] = (1920, 1040)
+    elif enhance:
+        screen = _xvfb_screen_constraint()
+        if screen is not None:
+            opts["screen"] = screen
+    if enhance:
+        webgl_pair = _pick_webgl_config(browser_os)
+        if webgl_pair:
+            opts["webgl_config"] = webgl_pair
+
+    tz_override = fp_timezone_override()
+    if tz_override:
+        cfg = dict(opts.get("config") or {})
+        cfg["timezone"] = tz_override
+        opts["config"] = cfg
 
     # 扩展（Camoufox 使用 addons 参数，加载 Firefox 扩展目录 / xpi）
     if _extension_path and os.path.exists(_extension_path):
         opts["addons"] = [_extension_path]
+    # camoufox fetch 失败时会留下空的 addons/UBO，启动时仍去加载并报
+    # "manifest.json is missing"。缺清单的默认扩展直接排除。
+    broken_defaults = _broken_default_addons()
+    if broken_defaults:
+        opts["exclude_addons"] = broken_defaults
 
     # Profile 隔离
     if unique_profile:
@@ -856,6 +1320,13 @@ def create_browser_options(unique_profile=True) -> dict:
         opts["persistent_context"] = True
         opts["user_data_dir"] = profile_dir
         _tls.profile_dir = profile_dir
+
+    har_path = resolve_record_har_path()
+    if har_path:
+        opts["record_har_path"] = har_path
+        opts["record_har_content"] = "embed"
+        opts["record_har_mode"] = "full"
+        opts["record_har_url_filter"] = "**/accounts.x.ai/**"
 
     return opts
 
@@ -870,7 +1341,18 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
     - 人类化鼠标轨迹
     """
     last_exc = None
+    try:
+        prune_default_har_dirs()
+    except Exception:
+        pass
     attempt_limit = browser_start_attempts()
+    if exit_ip_prefixes():
+        try:
+            from retry_policy import proxy_boot_rotations
+
+            attempt_limit = max(attempt_limit, int(proxy_boot_rotations() or 0) + 1)
+        except Exception:
+            attempt_limit = max(attempt_limit, 8)
     attempts_made = 0
     for attempt in range(1, attempt_limit + 1):
         attempts_made = attempt
@@ -878,8 +1360,35 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
         try:
             opts = create_browser_options(unique_profile=True)
             profile_dir = getattr(_tls, "profile_dir", None)
+            har_rec = str(opts.get("record_har_path") or "")
+            if log_callback and har_rec:
+                log_callback(f"[har] recording {har_rec}")
             if log_callback and isinstance(opts.get("geoip"), str):
                 log_callback(f"[Debug] geoip 使用预解析出口 IP: {opts['geoip']}")
+            if log_callback:
+                tz_used = str((opts.get("config") or {}).get("timezone") or "").strip()
+                scr = opts.get("screen")
+                scr_s = ""
+                if scr is not None:
+                    try:
+                        scr_s = f"{int(scr.min_width)}x{int(scr.min_height)}"
+                    except Exception:
+                        scr_s = str(scr)
+                if tz_used or scr_s:
+                    log_callback(
+                        f"[Debug] fp-override tz={tz_used or 'geoip'} "
+                        f"screen={scr_s or 'default'}"
+                    )
+            if log_callback and fingerprint_enhance_enabled():
+                wg = opts.get("webgl_config") or ()
+                renderer = str(wg[1] if len(wg) > 1 else "-")
+                if len(renderer) > 72:
+                    renderer = renderer[:72] + "…"
+                loc = opts.get("locale") or "geoip"
+                log_callback(
+                    f"[Debug] fp-enhance locale={loc} webgl={renderer} "
+                    f"(GROK_FP_ENHANCE=0 回滚)"
+                )
 
             # SafeCamoufox.__enter__() 直接创建全新事件循环，
             # 完全绕过 PlaywrightContextManager 的 get_running_loop() 检查
@@ -934,6 +1443,32 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 raw_page.set_default_timeout(60000)
             except Exception:
                 pass
+            try:
+                from turnstile_solver import (
+                    attach_browser_turnstile_hooks,
+                    load_turnstile_settings,
+                    should_attach_browser_turnstile_hooks,
+                )
+
+                ts = load_turnstile_settings()
+                provider = str(ts.get("provider") or "")
+                debug_cf = str(os.environ.get("GROK_CF_DEBUG") or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if should_attach_browser_turnstile_hooks(provider, debug=debug_cf):
+                    attach_browser_turnstile_hooks(
+                        raw_page,
+                        browser_context,
+                        log_callback=log_callback,
+                    )
+                    if log_callback:
+                        log_callback(f"[*] Turnstile widget hook 已安装 provider={provider}")
+            except Exception as hook_exc:
+                if log_callback:
+                    log_callback(f"[Debug] turnstile hooks failed: {hook_exc}")
 
             page_obj = CamoufoxPage(raw_page, browser_context)
             browser_obj = CamoufoxBrowser(
@@ -970,7 +1505,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 log_callback(
                     f"[Debug] 浏览器启动失败(第{attempt}/{attempt_limit}次, 连续失败{streak}): {redact_log_line(str(exc))}"
                 )
-            # 同一 sticky 出口探测失败：再试 3 次无意义，交给上层换口
+            # 同一 sticky 出口探测失败：默认交给上层换口；若挂了 rotate hook 则本层换口再试。
             msg = str(exc)
             if (
                 "无法解析出口 IP" in msg
@@ -978,6 +1513,8 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 or "代理不可用或过慢" in msg
                 or "出口IP命中黑名单" in msg
             ):
+                if attempt < attempt_limit and _invoke_proxy_rotate(msg, log_callback):
+                    continue
                 break
             # EPIPE / 驱动管道断开：稍等再起一个新 Node，不要立刻放弃
             if _is_driver_pipe_error(exc) and attempt < attempt_limit:
@@ -1001,6 +1538,8 @@ def stop_browser(force=False):
         return
     current = active_browser()
     profile_dir = getattr(_tls, "profile_dir", None)
+    har_path = str(getattr(_tls, "record_har_path", "") or "")
+    success_email = str(getattr(_tls, "record_har_success_email", "") or "")
     set_browser_session(None, None)
     if current is None:
         _cleanup_profile_dir(profile_dir)
@@ -1010,6 +1549,15 @@ def stop_browser(force=False):
     except BaseException:
         pass
     _cleanup_profile_dir(profile_dir)
+    if har_path and success_email:
+        try:
+            saved = _persist_success_har(har_path, success_email)
+            if saved:
+                _tls.record_har_saved = saved
+        except Exception:
+            pass
+    _tls.record_har_path = ""
+    _tls.record_har_success_email = ""
 
 
 def restart_browser(log_callback=None):

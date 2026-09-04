@@ -1857,6 +1857,153 @@ def grok2api_auth_filename(entry: dict, email: str = "") -> str:
     return f"g2a-{safe}.json"
 
 
+
+def _batch2_account_name(name: object) -> str:
+    """Prefix grok2api display names for the 2026-08-31 second batch."""
+    value = str(name or "").strip()
+    if not value or value.startswith("[b2]") or value.startswith("【b2】"):
+        return value
+    return "[b2] " + value
+
+
+def token_to_grok2api_account(token: dict, email: str = "") -> dict:
+    """token dict -> Grok2API grok_build import account."""
+    access = str(token.get("access_token") or token.get("key") or "").strip()
+    refresh = str(token.get("refresh_token") or "").strip()
+    payload = decode_jwt_payload(access)
+    email_val = str(email or "").strip() or str(payload.get("email") or "").strip()
+    user_id = (
+        str(payload.get("sub") or "").strip()
+        or str(payload.get("principal_id") or "").strip()
+    )
+    expires_at = ""
+    if "exp" in payload:
+        expires_at = rfc3339_ns(float(payload["exp"]))
+    elif token.get("expires_in") is not None:
+        try:
+            expires_at = rfc3339_ns(time.time() + int(token["expires_in"]))
+        except Exception:
+            expires_at = ""
+    return {
+        "provider": "grok_build",
+        "name": _batch2_account_name(email_val or user_id or "Grok Build account"),
+        "client_id": CLIENT_ID,
+        "access_token": access,
+        "refresh_token": refresh,
+        "id_token": "",
+        "token_type": str(token.get("token_type") or "Bearer") or "Bearer",
+        "scope": "",
+        "expires_at": expires_at,
+        "expires_in": 0,
+        "email": email_val,
+        "sub": "",
+        "user_id": user_id,
+        "principal_id": "",
+        "team_id": str(payload.get("team_id") or "").strip(),
+    }
+
+
+def grok2api_format_filename(format_name: str, entry: dict, email: str = "") -> str:
+    normalized = str(format_name or "").strip().lower()
+    if normalized == "grok_build":
+        return grok2api_auth_filename(entry, email=email)
+    if normalized not in {"grok_web", "grok_console"}:
+        raise ValueError("format_name must be grok_build, grok_web, or grok_console")
+    ident = (
+        str(email or "").strip()
+        or str(entry.get("email") or "").strip()
+        or str(entry.get("name") or "").strip()
+        or str(entry.get("user_id") or "").strip()
+        or secrets.token_hex(4)
+    )
+    safe = _safe_email_for_filename(ident)
+    prefix = "grok-web" if normalized == "grok_web" else "grok-console"
+    return f"{prefix}-{safe}.json"
+
+
+def token_to_grok2api_web_account(token: dict, email: str = "", sso: str = "") -> dict:
+    build = token_to_grok2api_account(token, email=email)
+    email_value = str(build.get("email") or email or "").strip()
+    user_id = str(build.get("user_id") or "").strip() or email_value
+    return {
+        "name": _batch2_account_name(email_value),
+        "email": email_value,
+        "user_id": user_id,
+        "sso_token": str(sso or "").strip(),
+        "token": "",
+        "tier": "basic",
+        "cloudflare_cookies": "",
+    }
+
+
+def token_to_grok2api_console_account(token: dict, email: str = "", sso: str = "") -> dict:
+    build = token_to_grok2api_account(token, email=email)
+    email_value = str(build.get("email") or email or "").strip()
+    user_id = str(build.get("user_id") or "").strip() or email_value
+    local_part = email_value.split("@", 1)[0] if email_value else user_id
+    return {
+        "name": _batch2_account_name(f"Grok Console {local_part}".strip()),
+        "email": email_value,
+        "user_id": user_id,
+        "sso_token": str(sso or "").strip(),
+        "token": "",
+        "cloudflare_cookies": "",
+    }
+
+
+def _write_grok2api_document(path: Path, document: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def write_grok2api_auth_bundle(
+    auth_dir: Path,
+    token: dict,
+    email: str = "",
+    sso: str = "",
+) -> dict:
+    """Write grok_build + grok_web + grok_console import files like old grok-register."""
+    ensure_private_dir(auth_dir)
+    web_account = token_to_grok2api_web_account(token, email=email, sso=sso)
+    console_account = token_to_grok2api_console_account(token, email=email, sso=sso)
+    return {
+        "grok_build": write_grok2api_import_auth(auth_dir, token, email=email),
+        "grok_web": _write_grok2api_document(
+            auth_dir / grok2api_format_filename("grok_web", web_account, email=email),
+            {"provider": "grok_web", "accounts": [web_account]},
+        ),
+        "grok_console": _write_grok2api_document(
+            auth_dir / grok2api_format_filename("grok_console", console_account, email=email),
+            {"provider": "grok_console", "accounts": [console_account]},
+        ),
+    }
+
+
+def write_grok2api_import_auth(auth_dir: Path, token: dict, email: str = "") -> Path:
+    """Write Grok2API-importable {"accounts":[grok_build...]} JSON."""
+    ensure_private_dir(auth_dir)
+    account = token_to_grok2api_account(token, email=email)
+    path = auth_dir / grok2api_auth_filename(account, email=email)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps({"accounts": [account]}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def write_grok2api_auth(auth_dir: Path, token: dict, email: str = "") -> Path:
     """写出 Grok2API / ~/.grok 风格 auth（issuer::client_id 嵌套）。"""
     ensure_private_dir(auth_dir)
@@ -2081,7 +2228,7 @@ def _config_bool(value: object, default: bool = False) -> bool:
 def apply_config_defaults(args) -> None:
     if not args.from_config:
         if getattr(args, "bfs_check", None) is None:
-            args.bfs_check = True
+            args.bfs_check = False
         if getattr(args, "bfs_skip_write", None) is None:
             args.bfs_skip_write = False
         if getattr(args, "bfs_disable", None) is None:
@@ -2099,7 +2246,7 @@ def apply_config_defaults(args) -> None:
     args.cpa_management_key = args.cpa_management_key or str(config.get("cpa_management_key") or "").strip()
     args.proxy = args.proxy or str(config.get("proxy") or "").strip()
     if getattr(args, "bfs_check", None) is None:
-        args.bfs_check = _config_bool(config.get("bfs_check"), True)
+        args.bfs_check = _config_bool(config.get("bfs_check"), False)
     if getattr(args, "bfs_skip_write", None) is None:
         args.bfs_skip_write = _config_bool(config.get("bfs_skip_cpa"), False)
     if getattr(args, "bfs_disable", None) is None:
@@ -2225,7 +2372,7 @@ def main() -> int:
         dest="bfs_check",
         action="store_true",
         default=None,
-        help="启用 JWT bfs claim 检测（默认开启，可由 config.json 覆盖）",
+        help="启用 JWT bfs claim 检测（默认关闭，可由 config.json 覆盖）",
     )
     ap.add_argument(
         "--no-bfs-check",

@@ -91,6 +91,7 @@ from browser_session import (
     start_browser,
     stop_browser,
     restart_browser,
+    is_browser_pipe_error,
     cleanup_runtime_memory,
     refresh_active_page,
     extract_cf_clearance_and_ua,
@@ -243,6 +244,8 @@ DEFAULT_CONFIG = {
     "cpa_auto_add": False,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
+    "sso_check": False,
+    "bfs_check": False,
     # CPA 本地 auth 目录（默认项目根目录下 cpa_auth/）
     "cpa_auth_dir": "cpa_auth",
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
@@ -1150,11 +1153,41 @@ def _registration_risk_should_block(state: dict) -> tuple:
     return False, ""
 
 
+def _config_enabled(key: str, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
+def release_browser_before_cpa(log_callback=None) -> bool:
+    """Close Camoufox before import/Guard unless device_browser CPA needs the page."""
+    token_mode = str(config.get("cpa_token_mode", "device_protocol") or "device_protocol").lower()
+    keep = token_mode == "device_browser" and _active_page() is not None
+    if keep:
+        if log_callback:
+            log_callback("[*] 浏览器 Device Flow 需要活动页面，暂不关浏览器")
+        return False
+    if log_callback:
+        log_callback("[*] 关闭浏览器后再 CPA/导入/Guard")
+    try:
+        stop_browser(force=True)
+    except Exception:
+        pass
+    return True
+
+
 def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
     """检查新账号风控状态；命中时保存 SSO 到隔离文件并终止正常入库。"""
     sso = _normalize_sso_token(raw_token)
     if not sso:
         raise RegistrationRiskDenied("注册风控检查失败: sso 为空")
+    if not _config_enabled("sso_check", False):
+        if log_callback:
+            log_callback("[风控] SSO 检测已关闭，跳过")
+        return {"found": False, "skipped": True, "sso_check": False}
 
     def _risk_log(message):
         if log_callback:
@@ -1430,9 +1463,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             return False
 
         # JWT bfs 检测（与 botFlagSource 独立；key 存在即标记）
-        bfs_check = config.get("bfs_check", True)
-        if isinstance(bfs_check, str):
-            bfs_check = bfs_check.strip().lower() not in ("0", "false", "no", "off")
+        bfs_check = _config_enabled("bfs_check", False)
         bfs_info = {"ok": False, "has_bfs": False, "bfs": None, "source": ""}
         if bfs_check:
             bfs_info = _s2cpa.inspect_token_bundle_bfs(
@@ -4140,6 +4171,7 @@ class GrokRegisterGUI:
                                 wlog(f"[!] NSFW 自动开启失败（账号仍可用，可网页手动开）: {nsfw_msg}")
                         except Exception as nsfw_exc:
                             wlog(f"[!] NSFW 步骤异常，已跳过: {nsfw_exc}")
+                    release_browser_before_cpa(log_callback=wlog)
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         # 以邮箱命名单独保存
@@ -4548,6 +4580,9 @@ def run_registration_cli(count):
                                 sso,
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
+                        release_browser_before_cpa(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        )
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         try:
                             with accounts_lock:
@@ -4662,14 +4697,7 @@ def run_registration_cli(count):
                             or "出口IP命中黑名单" in msg
                             or "命中黑名单" in msg
                         )
-                        pipe_dead = (
-                            "epipe" in msg.lower()
-                            or "econnreset" in msg.lower()
-                            or "target closed" in msg.lower()
-                            or "targetclosed" in msg.lower()
-                            or "browser has been closed" in msg.lower()
-                            or "connection closed" in msg.lower()
-                        )
+                        pipe_dead = is_browser_pipe_error(exc)
                         if proxy_dead:
                             record_proxy_boot_failure(
                                 get_bound_proxy() or get_thread_proxy(), exc
@@ -4972,6 +5000,7 @@ def run_registration_cli(count):
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                release_browser_before_cpa(log_callback=cli_log)
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
                     # 以邮箱命名单独保存
@@ -5119,17 +5148,7 @@ def run_registration_cli(count):
                         "命中黑名单",
                     )
                 )
-                pipe_dead = any(
-                    marker in message.lower()
-                    for marker in (
-                        "epipe",
-                        "econnreset",
-                        "target closed",
-                        "targetclosed",
-                        "browser has been closed",
-                        "connection closed",
-                    )
-                )
+                pipe_dead = is_browser_pipe_error(exc)
                 if proxy_dead:
                     record_proxy_boot_failure(
                         get_bound_proxy() or get_thread_proxy(), exc
