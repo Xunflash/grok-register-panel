@@ -14,7 +14,7 @@ from webui.status_snapshot import SnapshotWorker
 
 class StatusHttpTests(unittest.TestCase):
     def setUp(self):
-        self.worker = SnapshotWorker(lambda: {"process": {"running": False, "cmd": "private"}, "ok": 2, "tail": ["private"], "recent_ok": []})
+        self.worker = SnapshotWorker(lambda: {"process": {"running": False, "cmd": "private"}, "ok": 2, "tail": ["token=private", "visible log"], "recent_ok": []})
         self.worker.refresh()
         self.environment = patch.dict("os.environ", {"MONITOR_TOKEN": "fixture-monitor-token"})
         self.environment.start()
@@ -46,7 +46,8 @@ class StatusHttpTests(unittest.TestCase):
         with self.fetch("/api/status/v2") as response:
             self.assertEqual(response.status, 200)
             body = response.read()
-            self.assertNotIn(b"private", body)
+            self.assertNotIn(b"token=private", body)
+            self.assertIn(b"visible log", body)
             self.assertLess(len(body), 20000)
             self.assertEqual(json.loads(body)["schema_version"], 2)
             self.assertEqual(response.headers["Cache-Control"], "no-store")

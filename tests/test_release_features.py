@@ -27,9 +27,11 @@ class ReleaseFeaturesTests(unittest.TestCase):
             paginate({"items": [1, 2, 3]}, 2, 1, first["generation"])
 
     def test_status_parity_is_numeric_and_bounded(self):
-        value = summary({"control": {"mode": "orch", "guard_token": "secret"}, "traffic": {"batch_id": "private", "bytes_total": 100, "url": "private"}, "rates": {"1h": {"ok": 3}}, "ended": {"success": 3}})
+        value = summary({"control": {"mode": "orch", "guard_token": "secret"}, "traffic": {"batch_id": "private", "bytes_total": 100, "url": "private"}, "rates": {"1h": {"ok": 3}}, "ended": {"success": 3}, "tail": ["access_token=secretvalue https://user:pass@example.test/x", "ok"]})
         self.assertEqual(value["control"]["mode"], "orch")
         self.assertEqual(value["traffic"]["bytes_total"], 100)
+        self.assertEqual(value["tail"][-1], "ok")
+        self.assertLessEqual(len(value["tail"]), 40)
         self.assertNotIn("private", json.dumps(value))
         self.assertNotIn("secret", json.dumps(value))
         self.assertLess(len(json.dumps(value)), 20000)

@@ -4,6 +4,8 @@ import json
 import math
 import re
 
+from webui.security_utils import redact_log_line
+
 
 SCALARS = {"base_cpa", "base_cpa_stale", "cpa", "cpa_delta", "target", "done_attempts", "progress_pct", "success_rate", "rate_per_min", "eta", "workers", "ok", "fail", "domain", "skip", "bot0", "bot1", "bfs"}
 CONTROL = {"workers", "batch_count", "add_count", "risk_pause", "mode", "turnstile_provider", "registration_scheme"}
@@ -42,6 +44,11 @@ def summary(value):
     result["eta"] = eta if re.fullmatch(r"\d{1,6}(\.\d)?[mh]", eta) else None
     result["log_size"] = safe_scalar(value.get("log_size"))
     result["log_name"] = "批次日志"
+    result["tail"] = [
+        redact_log_line(str(line))[:1200]
+        for line in list(value.get("tail") or [])[-40:]
+        if str(line).strip()
+    ]
     result["caught_up"] = bool(value.get("caught_up", True))
     result["schema_version"] = 2
     result["state_version"] = etag(result).strip('"')
