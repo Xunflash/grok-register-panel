@@ -1,3 +1,7 @@
+Reliability work: [PRD](docs/PRD-reliability.md),
+[performance RFC](docs/RFC-003-panel-performance.md),
+[release and rollback](docs/RELEASE_ROLLBACK.md).
+
 <div align="center">
 
 # Grok Register + Live Panel
@@ -317,7 +321,7 @@ python grok_register_ttk.py
 
 ### 外部代理池
 
-- 支持单条或批量粘贴 `http://user:pass@host:port`、`host:port:user:pass`，也兼容 HTTPS / SOCKS URL
+- 支持单条或批量粘贴 `http://user:pass@proxy.example:8080`、`host:port:user:pass`，也兼容 HTTPS / SOCKS URL
 - 导入时规范化并去重，随后后台并发探活；GET 接口轮询检测进度
 - API 和 UI 只返回脱敏端点及 `has_auth`，不会返回代理账号或密码
 - worker 只选择“健康 + 启用”的条目，并在每个新账号创建浏览器前热加载一次

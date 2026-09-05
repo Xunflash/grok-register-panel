@@ -1,5 +1,9 @@
 # Release Checklist
 
+- [ ] Stack gates in `docs/RELEASE_ROLLBACK.md` pass; v2 is not enabled before UI and resource acceptance.
+- [ ] Immutable snapshot verified, restore drilled, and registration/recovery/import/sync admission closed and drained.
+- [ ] `python3 deploy/check_staged.py` and `git diff --check` pass.
+
 - [ ] Working tree contains only intended release files.
 - [ ] `scripts/run_tests.sh` passes from a clean clone.
 - [ ] `python -m pip check` passes in the deployment virtual environment.

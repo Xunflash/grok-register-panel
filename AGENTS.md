@@ -14,6 +14,15 @@ bulk abuse.
 
 ## Architecture And Ownership
 
+- `webui/status_snapshot.py` owns background sampling and cache lifetimes;
+  `webui/log_index.py` owns incremental parsing; `webui/api_projection.py`
+  owns bounded redacted wire views. HTTP readers never rescan full logs.
+- Guard owns risk classification and trusted pool membership; Grok2API owns
+  selector leases and final admission. Panel changes must not bypass either.
+- Stack PRD/RFC/Story status is maintained in the sibling
+  `grok2api-account-risk-guard/docs` directory. Every release needs the checked
+  immutable rollback baseline and no registration/recovery/import/sync jobs.
+
 - `register_flow.py`, `browser_session.py`, and `camoufox_adapter.py` own the
   browser registration flow, session lifecycle, exit checks, and Camoufox
   integration.

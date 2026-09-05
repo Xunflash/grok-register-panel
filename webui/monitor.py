@@ -12,7 +12,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -21,6 +21,9 @@ if str(ROOT) not in sys.path:
 from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir
 from batch_traffic import read_metrics as read_batch_traffic
 from batch_traffic import read_summary as read_batch_traffic_summary
+from webui.status_snapshot import SnapshotWorker, cached
+from webui.api_projection import etag, paginate, summary
+from webui.log_index import LogIndex
 from runtime_platform import (
     apply_playwright_node_env,
     batch_launch_command,
@@ -130,6 +133,8 @@ FONT_ASSETS = {
 }
 MONITOR_TOKEN_ENV = "MONITOR_TOKEN"
 PANEL_INCLUDE_TAIL = os.environ.get("PANEL_INCLUDE_TAIL", "0").strip() in ("1", "true", "yes")
+PANEL_STATUS_V2 = os.environ.get("PANEL_STATUS_V2", "0") == "1"
+LOG_INDEX = LogIndex()
 
 
 def _configured_process_roots(
@@ -368,6 +373,12 @@ def process_running():
 
 
 def parse_log(path, max_tail=400_000):
+    if PANEL_STATUS_V2:
+        return LOG_INDEX.read(path)
+    return parse_log_legacy(path, max_tail)
+
+
+def parse_log_legacy(path, max_tail=400_000):
     if not path or not path.is_file():
         return {"error": "no log"}
     size = path.stat().st_size
@@ -535,6 +546,7 @@ def blacklist_update_errors():
     }
 
 
+@cached(30)
 def success_stats():
     """Aggregate success stats: CPA + jsonl + time-window rates + latest batch."""
     from datetime import datetime, timezone, timedelta
@@ -929,7 +941,7 @@ def snapshot():
     bl = read_blacklist()
     bl_err = blacklist_update_errors()
     try:
-        rates = success_stats().get("rates") or {}
+        rates = STATS_SNAPSHOT().get("rates") or {}
     except Exception:
         rates = {}
     target = parsed.get("count_target") or control.get("batch_count") or 40
@@ -990,6 +1002,11 @@ def snapshot():
         "workers": workers_show,
         "tail": (parsed.get("tail") or []) if PANEL_INCLUDE_TAIL else ["(raw log tail disabled; set PANEL_INCLUDE_TAIL=1)"],
     }
+
+
+STATUS_WORKER = SnapshotWorker(snapshot)
+PROXY_SNAPSHOT = cached(3)(read_proxy_pool)
+STATS_SNAPSHOT = cached(30)(success_stats)
 
 
 HTML = r"""<!DOCTYPE html>
@@ -2282,7 +2299,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="proxy-import">
         <div class="field">
           <label for="proxy-input">代理地址（每行一条）</label>
-          <textarea id="proxy-input" spellcheck="false" autocomplete="off" placeholder="http://user:password@host:port&#10;host:port:user:password"></textarea>
+          <textarea id="proxy-input" spellcheck="false" autocomplete="off" placeholder="http://user:password@proxy.example:8080&#10;host:port:user:password"></textarea>
         </div>
         <div class="proxy-import-actions">
           <p class="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
@@ -3346,11 +3363,16 @@ async function deleteEmailDomain(id) {
     setMsg("domain-msg", "域名已删除", "ok");
   } catch (e) { setMsg("domain-msg", String(e.message || e), "err"); }
 }
+let refreshPending = false;
+let refreshDelay = 2000;
 async function refresh() {
+  if (refreshPending || document.hidden) return;
+  refreshPending = true;
   try {
     const d = await api("/api/status?_=" + Date.now(), { authHelp: false });
     last = d;
     render(d);
+    refreshDelay = d.process && d.process.running ? 2000 : 10000;
   } catch (e) {
     const message = String(e.message || e);
     document.getElementById("clock").textContent = message.includes("令牌") ? "需要令牌" : "连接异常";
@@ -3360,6 +3382,9 @@ async function refresh() {
       sync.className = "badge fail";
     }
     if (message.includes("令牌")) setMsg("ctrl-msg", message, "err");
+    refreshDelay = Math.min(30000, refreshDelay * 2);
+  } finally {
+    refreshPending = false;
   }
 }
 function fillControl(d) {
@@ -3935,8 +3960,11 @@ document.getElementById("fail-next").addEventListener("click", () => {
 syncThemeButtons();
 initHelp();
 loadTokenField();
-refresh();
-setInterval(refresh, 2000);
+async function pollStatus() {
+  await refresh();
+  setTimeout(pollStatus, refreshDelay);
+}
+pollStatus();
 // 完整成功统计：启动拉一次，之后每 30s 刷新（避免 2s 轮询冲掉）
 refreshStats(false);
 setInterval(() => refreshStats(false), 30000);
@@ -3973,13 +4001,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, cache_control="no-store", entity_tag=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
+        if entity_tag:
+            self.send_header("ETag", entity_tag)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -4055,7 +4085,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in FONT_ASSETS:
             path = FONT_ASSETS[u.path]
             if path.is_file():
-                self._send(200, path.read_bytes(), "font/woff2")
+                self._send(200, path.read_bytes(), "font/woff2", "public, max-age=86400")
             else:
                 self._send(404, b"not found", "text/plain")
             return
@@ -4065,12 +4095,41 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
+        if u.path in ("/api/status/v2", "/api/logs"):
+            if not self._require_read():
+                return
+            value, failed = STATUS_WORKER.read()
+            if value is None:
+                self._json(503, {"error": "snapshot warming", "retry_after": 2})
+                return
+            if u.path == "/api/logs":
+                query = parse_qs(u.query)
+                try:
+                    page = query.get("page", ["1"])[0]
+                    size = query.get("page_size", ["40"])[0]
+                    self._json(200, paginate({"items": value.get("recent_fail", []) + value.get("recent_ok", [])}, page, size))
+                except (ValueError, TypeError):
+                    self._json(400, {"error": "invalid pagination"})
+                return
+            value = summary(value)
+            value["stale"] = failed
+            value["sampled_at"] = STATUS_WORKER.sampled_at
+            tag = etag(value)
+            if self.headers.get("If-None-Match") == tag:
+                self._send(304, b"", "application/json", entity_tag=tag)
+                return
+            self._send(200, json.dumps(value).encode(), "application/json", entity_tag=tag)
+            return
         if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
             try:
-                self._json(200, snapshot())
+                value, failed = STATUS_WORKER.read() if PANEL_STATUS_V2 else (snapshot(), False)
+                if value is None:
+                    self._json(503, {"error": "snapshot warming"})
+                else:
+                    self._json(200, {**value, "stale": failed})
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
@@ -4111,9 +4170,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/proxies":
             try:
-                data = read_proxy_pool()
+                data = PROXY_SNAPSHOT()
                 data["resin_sync"] = resin_sync_status()
+                query = parse_qs(u.query)
+                if "page" in query:
+                    data = paginate(data, query["page"][0], query.get("page_size", ["50"])[0])
                 self._json(200, data)
+            except (ValueError, TypeError):
+                self._json(400, {"ok": False, "error": "invalid pagination"})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4421,7 +4485,12 @@ def main():
             flush=True,
         )
     print(f"[monitor] http://{host}:{BIND_PORT}/  (bound {host}:{BIND_PORT})", flush=True)
-    httpd.serve_forever()
+    if PANEL_STATUS_V2:
+        STATUS_WORKER.start()
+    try:
+        httpd.serve_forever()
+    finally:
+        STATUS_WORKER.close()
 
 
 if __name__ == "__main__":

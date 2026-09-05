@@ -23,6 +23,8 @@ tests=(
   tests/test_batch_traffic.py
   tests/test_retry_policy.py
   tests/test_monitor_http.py
+  tests/test_status_snapshot.py
+  tests/test_status_v2_http.py
   tests/test_proxy_store.py
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
