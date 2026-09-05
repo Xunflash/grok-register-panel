@@ -86,11 +86,11 @@ def create_temp_address(
     name: str = "",
     randomize_subdomain: bool = True,
 ) -> tuple[str, str]:
-    path = accounts_path if accounts_path.startswith("/") else f"/{accounts_path}"
+    path = accounts_path if str(accounts_path or "").startswith("/") else f"/{accounts_path}"
     url = f"{api_base.rstrip('/')}{path}"
     selected_domain = str(domain or "").strip()
-    # 根域批量易被标；默认挂随机子域（需 CF Email Routing 对 *.apex catch-all）
-    if selected_domain and randomize_subdomain:
+    # /admin/new_address 只接受 worker 里登记过的域名；随机子域会 400 Invalid domain
+    if selected_domain and randomize_subdomain and not is_admin_create_path(path):
         selected_domain = random_subdomain_domain(selected_domain)
 
     last_err: Exception | None = None
@@ -104,6 +104,8 @@ def create_temp_address(
             payload = {"name": local_name, "enablePrefix": False}
             if selected_domain:
                 payload["domain"] = selected_domain
+            if randomize_subdomain:
+                payload["enableRandomSubdomain"] = True
             headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
         else:
             payload = {}
@@ -127,7 +129,8 @@ def create_temp_address(
                     name = ""  # 强制下一轮重新生成
                     time.sleep(0.15 * (attempt + 1))
                     continue
-                resp.raise_for_status()
+                # Provider responses may echo credentials; keep the error generic.
+                raise RuntimeError(f"Cloudflare {path} HTTP {resp.status_code}")
             try:
                 data = resp.json()
             except Exception:

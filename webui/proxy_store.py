@@ -363,6 +363,7 @@ def _normalize_item(raw: object) -> dict | None:
         "success_count": _safe_int(raw.get("success_count")),
         "risk_count": _safe_int(raw.get("risk_count")),
         "source": _clean_text(raw.get("source") or "panel", 32),
+        "label": _clean_text(raw.get("label"), 120),
         "created_at": _clean_text(created_at, 40),
     }
 
@@ -469,6 +470,7 @@ def _public_item(item: dict, testing_ids: set[str], now: datetime) -> dict:
         "success_count": item.get("success_count", 0),
         "risk_count": item.get("risk_count", 0),
         "source": item.get("source") or "panel",
+        "label": item.get("label") or "",
         "created_at": item.get("created_at") or "",
     }
 

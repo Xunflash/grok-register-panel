@@ -1,0 +1,278 @@
+{
+  "log": {
+    "version": "1.2",
+    "creator": {
+      "name": "redacted-excerpt",
+      "version": "1"
+    },
+    "entries": [
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/cdn-cgi/rum?",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"eventType\": 1, \"location\": \"https://accounts.x.ai/sign-up\", \"nt\": \"navigate\", \"pageloadId\": \"pageload-fixture\", \"siteToken\": \"sitetoken-fixture\", \"startTime\": 1, \"versions\": {\"fl\": \"2024.11.0\", \"js\": \"2026.8.4\"}}"
+          }
+        },
+        "response": {
+          "status": 204
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/cdn-cgi/challenge-platform/h/b/jsd/oneshot/fixture-challenge/a",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "text/plain;charset=UTF-8"
+            }
+          ],
+          "postData": {
+            "mimeType": "text/plain;charset=UTF-8",
+            "text": "jsd-body-fixture"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/mp/track/?verbose=1&ip=1",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/x-www-form-urlencoded",
+            "text": "data=%5B%7B%22event%22%3A%22account_signup_flow_started%22%2C%22properties%22%3A%7B%22page_route%22%3A%22sign-up%22%2C%22xai_app_name%22%3A%22account%22%7D%7D%5D"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/observability/client-metrics",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"events\": [{\"type\": \"navigation\", \"path\": \"/sign-up\"}]}"
+          }
+        },
+        "response": {
+          "status": 204
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/send-verification-code",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "*/*"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Sec-Fetch-Dest",
+              "value": "empty"
+            },
+            {
+              "name": "Sec-Fetch-Mode",
+              "value": "cors"
+            },
+            {
+              "name": "Sec-Fetch-Site",
+              "value": "same-origin"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-fixture"
+            },
+            {
+              "name": "__cuid",
+              "value": "cuid-fixture"
+            },
+            {
+              "name": "OptanonConsent",
+              "value": "optanon-fixture"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"GladysVanderlugt4955@outlook.com\", \"castleRequestToken\": \"castle-token-fixture\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/sign-up/verify-email",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "*/*"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Sec-Fetch-Dest",
+              "value": "empty"
+            },
+            {
+              "name": "Sec-Fetch-Mode",
+              "value": "cors"
+            },
+            {
+              "name": "Sec-Fetch-Site",
+              "value": "same-origin"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-fixture"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"GladysVanderlugt4955@outlook.com\", \"code\": \"300747\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/sign-up/create-account",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-fixture"
+            },
+            {
+              "name": "__cf_bm",
+              "value": "cf-bm-fixture"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"fixture@example.com\", \"password\": \"FixturePass1!\", \"givenName\": \"Ada\", \"familyName\": \"Lovelace\", \"emailValidationCode\": \"123456\", \"turnstileToken\": \"turnstile-token-fixture\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      }
+    ]
+  }
+}

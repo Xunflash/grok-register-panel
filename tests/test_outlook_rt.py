@@ -698,6 +698,204 @@ def test_transient_graph_failure_does_not_consume_inventory():
         assert "RT_PRIVATE" not in "\n".join(logs)
 
 
+def test_has_graph_mail_scope():
+    assert outlook_rt._has_graph_mail_scope(
+        "https://graph.microsoft.com/.default "
+        "https://graph.microsoft.com/Mail.ReadWrite "
+        "https://graph.microsoft.com/IMAP.AccessAsUser.All"
+    )
+    assert outlook_rt._has_graph_mail_scope(
+        "https://graph.microsoft.com/Mail.Read offline_access"
+    )
+    assert not outlook_rt._has_graph_mail_scope(
+        "https://graph.microsoft.com/.default "
+        "https://graph.microsoft.com/IMAP.AccessAsUser.All "
+        "https://graph.microsoft.com/POP.AccessAsUser.All "
+        "https://graph.microsoft.com/SMTP.Send"
+    )
+    assert not outlook_rt._has_graph_mail_scope("")
+    assert not outlook_rt._has_graph_mail_scope("Mail.ReadBasic")
+
+
+def test_take_mailbox_skips_imap_only_scope():
+    """IMAP/POP/SMTP-only RT 会 Graph 401，预检应弃用并换下一个。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [
+                {"email": "imap@outlook.com", "refresh_token": "RT_IMAP"},
+                {"email": "mail@outlook.com", "refresh_token": "RT_MAIL"},
+            ],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, data=None, **kwargs):
+            rt = str((data or {}).get("refresh_token") or "") if isinstance(data, dict) else ""
+            if rt == "RT_IMAP":
+                return Resp(
+                    {
+                        "access_token": "AT_IMAP",
+                        "scope": (
+                            "https://graph.microsoft.com/.default "
+                            "https://graph.microsoft.com/IMAP.AccessAsUser.All "
+                            "https://graph.microsoft.com/POP.AccessAsUser.All "
+                            "https://graph.microsoft.com/SMTP.Send"
+                        ),
+                    }
+                )
+            return Resp(
+                {
+                    "access_token": "AT_MAIL",
+                    "scope": (
+                        "https://graph.microsoft.com/.default "
+                        "https://graph.microsoft.com/Mail.ReadWrite "
+                        "https://graph.microsoft.com/IMAP.AccessAsUser.All"
+                    ),
+                }
+            )
+
+        logs = []
+        email, token = outlook_rt.take_mailbox(
+            str(inv),
+            http_post=http_post,
+            log_callback=logs.append,
+            max_attempts=5,
+        )
+        assert email == "mail@outlook.com"
+        assert token.startswith("outlook_rt:")
+        used = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+        assert "imap@outlook.com" in used
+        assert "missing_mail_scope" in used
+        assert "mail@outlook.com" not in {
+            line.split("----", 1)[0].strip().lower()
+            for line in used.splitlines()
+            if line.strip()
+        }
+        assert any("missing_mail_scope" in line for line in logs)
+
+
+def test_take_mailbox_skips_inbox_401():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [
+                {"email": "noauth@outlook.com", "refresh_token": "RT_NOAUTH"},
+                {"email": "ok@outlook.com", "refresh_token": "RT_OK"},
+            ],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, **kwargs):
+            return Resp(
+                {
+                    "access_token": "AT",
+                    "scope": "https://graph.microsoft.com/Mail.ReadWrite",
+                }
+            )
+
+        def http_get(url, **kwargs):
+            if "mailFolders/inbox" in str(url) and "messages" not in str(url):
+                if http_get.calls == 0:
+                    http_get.calls += 1
+                    return Resp({}, status=401)
+                http_get.calls += 1
+                return Resp({"totalItemCount": 4, "unreadItemCount": 1})
+            return Resp({"value": []})
+
+        http_get.calls = 0
+        logs = []
+        email, token = outlook_rt.take_mailbox(
+            str(inv),
+            http_post=http_post,
+            http_get=http_get,
+            log_callback=logs.append,
+            max_attempts=5,
+            skip_empty_inbox=True,
+        )
+        assert email == "ok@outlook.com"
+        used = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+        assert "noauth@outlook.com" in used
+        assert "precheck_graph_auth" in used
+        assert "ok@outlook.com" not in {
+            line.split("----", 1)[0].strip().lower()
+            for line in used.splitlines()
+            if line.strip()
+        }
+        assert any("弃用当前库存项" in line and "401" in line for line in logs)
+        assert not any("保留该号继续用" in line for line in logs)
+
+
+def test_wait_for_code_fast_fail_on_repeated_graph_401():
+    """refresh 成功但 Graph 一直 401 时应秒退，不能把失败计数清零后空耗 timeout。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [{"email": "graph401@outlook.com", "refresh_token": "RT_GRAPH401"}],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+        email, token_key = outlook_rt.take_mailbox(str(inv))
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, **kwargs):
+            return Resp({"access_token": "AT"})
+
+        def http_get(url, **kwargs):
+            return Resp({}, status=401)
+
+        t0 = time.time()
+        try:
+            outlook_rt.wait_for_code(
+                http_get,
+                http_post,
+                token_key,
+                email,
+                timeout=180,
+                poll_interval=0,
+                raise_if_cancelled=lambda _c: None,
+                sleep_with_cancel=lambda _s, _c: None,
+            )
+            raise AssertionError("expected graph auth fail")
+        except Exception as exc:
+            assert "Graph 鉴权失败" in str(exc) or "已弃用" in str(exc)
+        elapsed = time.time() - t0
+        assert elapsed < 5, f"should fast-fail, took {elapsed:.1f}s"
+        used = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+        assert "graph401@outlook.com" in used
+        assert "graph_auth_fail" in used
+
+
 if __name__ == "__main__":
     test_load_jsonl_and_text_formats()
     test_take_mark_used_and_stats()
@@ -714,4 +912,8 @@ if __name__ == "__main__":
     test_wait_for_code_fast_fail_on_dead_refresh()
     test_probe_persists_rotated_refresh_token_without_consuming_inventory()
     test_transient_graph_failure_does_not_consume_inventory()
+    test_has_graph_mail_scope()
+    test_take_mailbox_skips_imap_only_scope()
+    test_take_mailbox_skips_inbox_401()
+    test_wait_for_code_fast_fail_on_repeated_graph_401()
     print("ok")

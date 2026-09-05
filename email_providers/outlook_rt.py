@@ -126,6 +126,13 @@ _DEAD_RT_MARKERS = (
     "AADSTS700084",
     "invalid_grant",
     "interaction_required",
+    "missing_mail_scope",
+)
+_GRAPH_MAIL_SCOPE_TOKENS = (
+    "mail.read",
+    "mail.readwrite",
+    "https://graph.microsoft.com/mail.read",
+    "https://graph.microsoft.com/mail.readwrite",
 )
 
 
@@ -149,6 +156,59 @@ def inventory_lock_path(inventory_path: str) -> Path:
 def _is_dead_rt_error(err: Any) -> bool:
     text = str(err or "").lower()
     return any(marker.lower() in text for marker in _DEAD_RT_MARKERS)
+
+
+_TRANSIENT_PRECHECK_MARKERS = (
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 407",
+    "http 429",
+    "http 408",
+    "upstream_connect_failed",
+    "proxyerror",
+    "connect tunnel",
+    "bad gateway",
+    "timeout",
+    "timed out",
+    "temporarily",
+    "connection reset",
+    "no_available_nodes",
+    "authentication required",
+)
+
+
+def _is_transient_precheck_error(err: Any) -> bool:
+    """Proxy/network failures must not retire inventory."""
+    if _is_dead_rt_error(err):
+        return False
+    text = str(err or "").lower()
+    return any(marker in text for marker in _TRANSIENT_PRECHECK_MARKERS)
+
+
+def _has_graph_mail_scope(scope: str) -> bool:
+    """True if the token response grants Graph Mail.Read / Mail.ReadWrite."""
+    parts = {
+        item.strip().lower().rstrip("/")
+        for item in str(scope or "").replace(",", " ").split()
+        if item.strip()
+    }
+    if not parts:
+        return False
+    if parts & set(_GRAPH_MAIL_SCOPE_TOKENS):
+        return True
+    return any(
+        item.endswith("/mail.read") or item.endswith("/mail.readwrite")
+        for item in parts
+    )
+
+
+def _is_graph_auth_error(err: Any) -> bool:
+    text = str(err or "").lower()
+    if "401" in text or "403" in text:
+        return True
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    return status in (401, 403)
 
 
 def _safe_error(exc: Any) -> str:
@@ -353,7 +413,6 @@ def mark_used(
     used_file.parent.mkdir(parents=True, exist_ok=True)
     line = email_key
     if reason:
-        # 仅注释用途，_load_used 会取 @ 前的邮箱段
         safe = str(reason).replace("\n", " ").strip()[:120]
         line = f"{email_key}----{safe}"
     with _lock:
@@ -530,6 +589,15 @@ def refresh_access_token(
                                 token_data = {}
                         access = token_data.get("access_token")
                         if access:
+                            scope = str(token_data.get("scope") or "")
+                            # Microsoft 会给 IMAP/POP/SMTP-only RT 签发 access_token，
+                            # 但 Graph /me/mailFolders 会 401。有 scope 却没有
+                            # Mail.Read* 时直接弃用，避免空等 180s。
+                            if scope and not _has_graph_mail_scope(scope):
+                                last_err = "missing_mail_scope"
+                                raise RuntimeError(
+                                    "Outlook RT refresh 失败: missing_mail_scope"
+                                )
                             account["client_id"] = client_id
                             new_rt = token_data.get("refresh_token") or refresh_token
                             if new_rt and new_rt != refresh_token:
@@ -608,8 +676,10 @@ def take_mailbox(
 
     若传入 http_post，会在取号后立刻 refresh 预检：
     - 成功：返回 (email, token_key)
-    - 失败：mark_used 并换下一个，避免把死 RT 带进 180s 等码
+    - 失败（死 RT / 无 Mail.Read*）：mark_used 并换下一个，避免把死号带进 180s 等码
+    - 代理/网络失败（502/503/超时等）：不 mark_used，换下一个继续预检
     若同时传入 http_get 且 skip_empty_inbox，Inbox 为 0 的号直接跳过。
+    Graph Inbox 401/403 视为无读信权限，同样 mark_used 换号。
 
     返回 (email, token_key)。token_key 供 wait_for_code 使用。
     """
@@ -671,17 +741,26 @@ def take_mailbox(
             )
         except Exception as exc:
             last_err = _safe_error(exc)
+            transient = _is_transient_precheck_error(exc) or _is_transient_precheck_error(
+                last_err
+            )
             if log_callback:
-                log_callback(f"[!] Outlook RT 预检失败，弃用当前库存项: {last_err}")
-            try:
-                mark_used(
-                    email,
-                    path,
-                    used_path,
-                    reason=f"precheck_fail:{last_err}",
-                )
-            except Exception:
-                pass
+                if transient:
+                    log_callback(
+                        f"[!] Outlook RT 预检失败（代理/网络，保留库存）: {last_err}"
+                    )
+                else:
+                    log_callback(f"[!] Outlook RT 预检失败，弃用当前库存项: {last_err}")
+            if not transient:
+                try:
+                    mark_used(
+                        email,
+                        path,
+                        used_path,
+                        reason=f"precheck_fail:{last_err}",
+                    )
+                except Exception:
+                    pass
             release_reservation(token_key, email)
             continue
 
@@ -690,6 +769,31 @@ def take_mailbox(
                 inbox_n = inbox_total_count(http_get, access)
             except Exception as exc:
                 last_err = _safe_error(exc)
+                if _is_transient_precheck_error(exc) or _is_transient_precheck_error(
+                    last_err
+                ):
+                    if log_callback:
+                        log_callback(
+                            f"[!] Outlook RT Inbox 预检失败（代理/网络，保留库存）: {last_err}"
+                        )
+                    release_reservation(token_key, email)
+                    continue
+                if _is_graph_auth_error(exc) or _is_graph_auth_error(last_err):
+                    if log_callback:
+                        log_callback(
+                            f"[!] Outlook RT Inbox 预检失败，弃用当前库存项: {last_err}"
+                        )
+                    try:
+                        mark_used(
+                            email,
+                            path,
+                            used_path,
+                            reason=f"precheck_graph_auth:{last_err}",
+                        )
+                    except Exception:
+                        pass
+                    release_reservation(token_key, email)
+                    continue
                 if log_callback:
                     log_callback(
                         f"[!] Outlook RT Inbox 预检失败，保留该号继续用: {last_err}"
@@ -1008,19 +1112,26 @@ def _wait_for_code_unlocked(
                 default_client_id=default_client_id,
             )
             last_refresh_err = ""
-            refresh_failures = 0
-            info["refresh_failures"] = 0
         except Exception as exc:
             last_refresh_err = _safe_error(exc)
-            refresh_failures += 1
-            info["refresh_failures"] = refresh_failures
+            transient = _is_transient_precheck_error(exc) or _is_transient_precheck_error(
+                last_refresh_err
+            )
+            if not transient:
+                refresh_failures += 1
+                info["refresh_failures"] = refresh_failures
             if log_callback:
                 log_callback(
                     f"[Debug] Outlook RT token 刷新失败 "
                     f"({refresh_failures}/{max_rf}): {last_refresh_err}"
+                    + ("（代理/网络，不弃号）" if transient else "")
                 )
-            # 死号或连续失败：秒退，不再空耗 timeout
-            if _is_dead_rt_error(exc) or refresh_failures >= max_rf:
+            if _is_dead_rt_error(exc) or _is_dead_rt_error(last_refresh_err):
+                _retire(f"refresh_fail:{last_refresh_err[:80]}")
+                raise Exception(
+                    f"Outlook RT refresh 不可用，已弃用当前库存项: {last_refresh_err}"
+                ) from exc
+            if not transient and refresh_failures >= max_rf:
                 _retire(f"refresh_fail:{last_refresh_err[:80]}")
                 raise Exception(
                     f"Outlook RT refresh 不可用，已弃用当前库存项: {last_refresh_err}"
@@ -1034,19 +1145,19 @@ def _wait_for_code_unlocked(
             safe_graph_error = _safe_error(exc)
             if log_callback:
                 log_callback(f"[Debug] Outlook RT 拉取邮件失败: {safe_graph_error}")
-            # Graph 401/403 也计一次 refresh 相关失败，避免死循环
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            err_s = safe_graph_error
-            if "401" in err_s or "403" in err_s or status in (401, 403):
+            # Graph 401/403 也计一次失败。成功 refresh 不得清零，否则会空耗 timeout。
+            if _is_graph_auth_error(exc) or _is_graph_auth_error(safe_graph_error):
                 account.pop("_access_token", None)
                 account.pop("_access_expires", None)
                 refresh_failures += 1
                 info["refresh_failures"] = refresh_failures
                 if refresh_failures >= max_rf:
-                    _retire(f"graph_auth_fail:{err_s[:80]}")
+                    _retire(f"graph_auth_fail:{safe_graph_error[:80]}")
                     raise Exception("Outlook RT Graph 鉴权失败，已弃用当前库存项") from exc
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
+        refresh_failures = 0
+        info["refresh_failures"] = 0
         code = find_code_in_messages(messages, seen=seen, after_ts=after_ts)
         if code:
             if mark_on_success and inventory_path:
@@ -1108,10 +1219,6 @@ def _wait_for_code_unlocked(
         sleep_with_cancel(poll_interval, cancel_callback)
 
     hint = f"；最后刷新错误: {last_refresh_err}" if last_refresh_err else ""
-    # 等满 timeout：
-    # - 必须 release 预留，否则同进程换号会误判「库存耗尽」
-    # - 若 refresh 一直正常（last_refresh_err 空），说明 xAI 侧可能已占用该邮箱，
-    #   mark used 避免反复空等；若 refresh 曾失败则已在上面 retire
     if inventory_path and not last_refresh_err and not graph_transient_failure:
         try:
             mark_used(

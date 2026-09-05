@@ -163,62 +163,56 @@ def read_verified_pid_file(
     return pid if process_matches(pid, root, script_names) else None
 
 
+def _collect_descendant_pids(pids: set[int]) -> set[int]:
+    tree = set(pids)
+    for pid in list(pids):
+        try:
+            for child in psutil.Process(pid).children(recursive=True):
+                tree.add(child.pid)
+        except PROCESS_ERRORS:
+            continue
+    return tree
+
+
 def terminate_managed_processes(
     root: str | os.PathLike[str],
     script_names: tuple[str, ...] | list[str],
     *,
-    grace_seconds: float = 2.0,
+    grace_seconds: float = 3.0,
 ) -> list[int]:
     processes = find_managed_processes(root, script_names)
     pids = {item["pid"] for item in processes}
     if not pids:
         return []
 
-    if os.name != "posix":
-        _terminate_process_trees(pids, grace_seconds)
-        return sorted(pids)
+    # Camoufox / Playwright 会自己 setsid，killpg 父进程组杀不掉浏览器，
+    # 面板点停止后 python 死了、浏览器还在，看起来像停不掉。
+    tree = _collect_descendant_pids(pids)
+    _terminate_process_trees(tree, grace_seconds)
 
-    groups: set[int] = set()
-    direct: set[int] = set()
-    for pid in pids:
-        try:
-            pgid = os.getpgid(pid)
-        except OSError:
-            direct.add(pid)
-            continue
-        if pgid == pid:
-            groups.add(pgid)
-        else:
-            direct.add(pid)
+    if os.name == "posix":
+        pgids: set[int] = set()
+        for pid in tree:
+            try:
+                pgids.add(os.getpgid(pid))
+            except OSError:
+                continue
+        for pgid in pgids:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
 
-    for pgid in groups:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except OSError:
-            pass
-    for pid in direct:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-
-    deadline = time.monotonic() + max(0.0, grace_seconds)
-    while time.monotonic() < deadline:
-        if not find_managed_processes(root, script_names):
-            break
-        time.sleep(0.1)
-
-    remaining = find_managed_processes(root, script_names)
-    for item in remaining:
+    leftover = find_managed_processes(root, script_names)
+    for item in leftover:
         pid = item["pid"]
         try:
-            pgid = os.getpgid(pid)
-            if pgid == pid:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
+            psutil.Process(pid).kill()
+        except PROCESS_ERRORS:
+            try:
                 os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+            except OSError:
+                pass
     return sorted(pids)
 
 

@@ -182,6 +182,12 @@ FIELD_DEFINITIONS = {
         "default": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
         "placeholder": "默认 Microsoft Authentication Broker",
     },
+    "outlook_rt_resin_platform": {
+        "label": "Resin 平台（刷 token / Graph）",
+        "type": "text",
+        "default": "outlook",
+        "placeholder": "outlook",
+    },
     "inbucket_api_base": {
         "label": "实例地址",
         "type": "url",
@@ -238,6 +244,7 @@ PROVIDER_FIELDS = {
         "outlook_rt_inventory",
         "outlook_rt_used_path",
         "outlook_rt_client_id",
+        "outlook_rt_resin_platform",
     ),
     "inbucket": ("inbucket_api_base", "inbucket_domain", "inbucket_random_levels"),
 }

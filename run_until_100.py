@@ -350,8 +350,15 @@ def main():
                 return_code = proc.poll()
                 log(f"  batch exited rc={return_code}")
                 if return_code == PRECHECK_EXIT_CODE:
-                    log("ORCH STOP xAI registration page precheck failed")
-                    return
+                    consecutive_batch_failures += 1
+                    log(
+                        "xAI registration page precheck failed; "
+                        f"retry next round ({consecutive_batch_failures}/{failure_limit})"
+                    )
+                    if consecutive_batch_failures >= failure_limit:
+                        log("ORCH STOP xAI registration page precheck failed")
+                        return
+                    break
                 if return_code not in (0, None):
                     consecutive_batch_failures += 1
                     if consecutive_batch_failures >= failure_limit:

@@ -275,7 +275,7 @@ DEFAULT_CONFIG = {
     "guard_url": "http://192.168.0.5:8788",
     "guard_token": "",
     # 注册机等 Guard 新号检测的秒数。0=跟随 Guard 策略；默认 300=5 分钟。
-    "guard_register_check_timeout_seconds": 300,
+    "guard_register_check_timeout_seconds": 600,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
     "registration_scheme": "browser",
@@ -1239,7 +1239,7 @@ def _guard_register_check(email: str, log_callback=None) -> dict:
         exit_ip = ""
     timeout_seconds = _guard_register_timeout_seconds()
     if timeout_seconds <= 0:
-        timeout_seconds = 300
+        timeout_seconds = 600
     http_timeout = timeout_seconds + 60
     body = {
         "email": str(email or "").strip(),
@@ -1315,7 +1315,8 @@ def _apply_guard_register_result(email: str, payload: dict, log_callback=None) -
         return
     if payload.get("error") or payload.get("timed_out"):
         if log_callback and not payload.get("error"):
-            log_callback("[guard] 新号检测超时，本号不拉黑")
+            reason = payload.get("reason") or "timeout"
+            log_callback(f"[guard] 新号检测未完成 reason={reason}，本号不拉黑")
         return
     if not payload.get("risk"):
         if log_callback:

@@ -7,6 +7,7 @@ import random
 import re
 import secrets
 import string
+import threading
 import time
 from typing import Any, Dict
 
@@ -16,12 +17,23 @@ from browser_session import (
     active_browser,
     active_page,
     browser,
+    get_bound_proxy,
     page,
     refresh_active_page,
     restart_browser,
     set_browser_session,
     start_browser,
     stop_browser,
+)
+from turnstile_solver import (
+    CLOUD_PROVIDERS,
+    DEFAULT_XAI_SITEKEY,
+    attach_browser_turnstile_hooks,
+    ensure_page_turnstile_hooks,
+    load_turnstile_settings,
+    set_live_token,
+    solve_turnstile_capsolver,
+    solve_turnstile_yescaptcha,
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -58,8 +70,17 @@ def _reload_signup(log_callback=None, reason: str = "页面错误") -> bool:
 CF_FIRST_RETRY_AFTER = 3.0   # 检测到 CF 后 3 秒即开始尝试
 CF_RETRY_INTERVAL = 8.0      # 两次完整 getTurnstileToken 间隔（原 15s 过慢）
 CF_WAIT_LOG_INTERVAL = 5.0
-PROFILE_TIMEOUT = 70         # 资料页总超时（含 Turnstile / OTP 未跳转）
+PROFILE_TIMEOUT = 120        # 资料页总超时；对齐上游 fill_profile_and_submit(timeout=120)
+# 浏览器注册等 sso cookie。过短会在 createAccount / redirect 未完成时硬跳 grok.com。
+SSO_WAIT_TIMEOUT_DEFAULT = 90
+SSO_WAIT_TIMEOUT_FLOOR = 60
+SSO_ACCOUNTS_HOLD_SECONDS = 40
+SSO_GROK_NUDGE_MIN_ELAPSED = 55
+SSO_FINAL_NO_SUBMIT_TIMEOUT = 20
 PROFILE_CF_MAX_ROUNDS = 3    # Turnstile 完整复用最大次数，超限换口
+# 实测一次过框大约 30s；18s 会把成功也掐掉。上限 40s，并给提交留余量。
+TURNSTILE_CLICK_BUDGET = 40.0
+TURNSTILE_SUBMIT_RESERVE = 12.0
 PROFILE_PROBE_LOG_INTERVAL = 5.0
 
 _deps: Dict[str, Any] = {}
@@ -513,8 +534,12 @@ def _reload_signup_and_open_email(log_callback=None, cancel_callback=None):
     refresh_active_page()
     try:
         if page:
+            current = str(getattr(page, "url", "") or "")
             try:
-                page.refresh()
+                if signup_page_is_accounts_host(current):
+                    page.refresh()
+                else:
+                    page.get(SIGNUP_URL)
             except Exception:
                 try:
                     page.get(SIGNUP_URL)
@@ -662,6 +687,18 @@ return candidates[0].text || true;
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
+
+def signup_page_is_accounts_host(url: str) -> bool:
+    """True only when the page host is accounts.x.ai.
+
+    x.com OAuth authorize URLs include accounts.x.ai in redirect_uri query
+    and must not count as the signup page.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host == "accounts.x.ai" or host.endswith(".accounts.x.ai")
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     if active_browser() is None:
@@ -683,9 +720,14 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         set_browser_session(browser_obj, page_obj)
         page_obj.get(SIGNUP_URL)
         page_obj.wait.doc_loaded()
-        # 确认真的进了注册域；about:blank / 错页直接失败
+        # Host must be accounts.x.ai. Do not use "x.ai" in the full URL:
+        # x.com OAuth authorize includes accounts.x.ai only as redirect_uri.
         current = str(getattr(page_obj, "url", "") or "")
-        if "accounts.x.ai" not in current and "x.ai" not in current:
+        if not signup_page_is_accounts_host(current):
+            page_obj.get(SIGNUP_URL)
+            page_obj.wait.doc_loaded()
+            current = str(getattr(page_obj, "url", "") or "")
+        if not signup_page_is_accounts_host(current):
             raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
 
     try:
@@ -920,7 +962,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     return False
 
 
-def fill_email_and_submit(timeout=10, log_callback=None, cancel_callback=None):
+def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     email, dev_token = _deps['get_email_and_token']()
     if not email or not dev_token:
@@ -1488,7 +1530,7 @@ def _should_retry_cf(wait_cf_since, last_cf_retry_at, now=None) -> bool:
 
 
 def _fill_cf_turnstile_token(token) -> Any:
-    """把 Turnstile token 写回页面隐藏域。"""
+    """把 Turnstile token 写回页面隐藏域。本地点击路径继续用这个。"""
     return page.run_js(
         """
 const token = String(arguments[0] || '').trim();
@@ -1505,18 +1547,175 @@ return String(cfInput.value || '').trim().length;
     )
 
 
+_cf_token_tls = threading.local()
+_CF_TOKEN_TTL = 110.0
+
+_INJECT_YESCAPTCHA_JS = """
+const token = String(arguments[0] || '').trim();
+if (!token) return 0;
+window.__grokCfToken = token;
+
+function setNative(input, value) {
+  if (!input) return;
+  try {
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue('');
+  } catch (e) {}
+  const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+  if (desc && desc.set) desc.set.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+let filled = 0;
+const nodes = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"]');
+nodes.forEach((el) => { setNative(el, token); filled += 1; });
+if (!filled) {
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.name = 'cf-turnstile-response';
+  setNative(input, token);
+  (document.querySelector('form') || document.body).appendChild(input);
+  filled = 1;
+}
+
+try {
+  if (window.turnstile) {
+    window.turnstile.getResponse = function () { return window.__grokCfToken || token; };
+  }
+} catch (e) {}
+
+try {
+  const cbs = window.__grokTsCallbacks || [];
+  for (let i = 0; i < cbs.length; i++) {
+    try { cbs[i](token); } catch (e) {}
+  }
+} catch (e) {}
+
+document.querySelectorAll('[data-callback]').forEach((el) => {
+  const name = el.getAttribute('data-callback');
+  try {
+    if (name && typeof window[name] === 'function') window[name](token);
+  } catch (e) {}
+});
+
+function walkFiber(node, depth) {
+  if (!node || depth > 28) return false;
+  const props = node.memoizedProps || node.pendingProps || {};
+  const names = ['onSuccess', 'onVerify', 'callback', 'onToken', 'onComplete', 'onChange'];
+  for (let i = 0; i < names.length; i++) {
+    const fn = props[names[i]];
+    if (typeof fn === 'function') {
+      try { fn(token); return true; } catch (e) {}
+    }
+  }
+  if (walkFiber(node.child, depth + 1)) return true;
+  if (walkFiber(node.sibling, depth + 1)) return true;
+  return false;
+}
+document.querySelectorAll('[data-sitekey], .cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').forEach((el) => {
+  let host = el;
+  for (let i = 0; i < 6 && host; i++) {
+    const keys = Object.keys(host);
+    for (let k = 0; k < keys.length; k++) {
+      if (keys[k].startsWith('__reactFiber') || keys[k].startsWith('__reactInternalInstance')) {
+        try { walkFiber(host[keys[k]], 0); } catch (e) {}
+      }
+    }
+    host = host.parentElement;
+  }
+});
+
+const msgPayloads = [
+  { source: 'cloudflare-challenge', event: 'complete', token: token },
+  { event: 'complete', token: token },
+  { type: 'complete', token: token },
+];
+msgPayloads.forEach((data) => {
+  try {
+    window.dispatchEvent(new MessageEvent('message', {
+      data: data,
+      origin: 'https://challenges.cloudflare.com',
+    }));
+  } catch (e) {}
+});
+
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+return String((cfInput && cfInput.value) || token || '').trim().length;
+"""
+
+
+def _stash_cf_token(token: str) -> None:
+    value = str(token or "").strip()
+    _cf_token_tls.token = value
+    _cf_token_tls.at = time.time() if value else 0.0
+    try:
+        set_live_token(value)
+    except Exception:
+        pass
+
+
+def _stashed_cf_token(max_age: float = _CF_TOKEN_TTL) -> str:
+    token = str(getattr(_cf_token_tls, "token", "") or "").strip()
+    at = float(getattr(_cf_token_tls, "at", 0) or 0)
+    if len(token) >= 80 and (time.time() - at) < max_age:
+        return token
+    return ""
+
+
+def _ensure_turnstile_page_hooks(log_callback=None) -> dict:
+    """Make sure turnstile.render is wrapped on the current sign-up document."""
+    try:
+        raw = getattr(page, "raw_page", None)
+        ctx = getattr(page, "raw_context", None)
+        if raw is not None:
+            attach_browser_turnstile_hooks(raw, ctx, log_callback=log_callback)
+    except Exception:
+        pass
+    try:
+        return ensure_page_turnstile_hooks(page.run_js)
+    except Exception:
+        return {}
+
+
+def _inject_yescaptcha_token(token: str) -> Any:
+    """云打码回填：隐藏域 + getResponse + callback + fetch 钩子。"""
+    _ensure_turnstile_page_hooks()
+    try:
+        return page.run_js(_INJECT_YESCAPTCHA_JS, token)
+    except Exception:
+        return _fill_cf_turnstile_token(token)
+
+
+def _cloud_turnstile_enabled() -> bool:
+    try:
+        return load_turnstile_settings().get("provider") in CLOUD_PROVIDERS
+    except Exception:
+        return False
+
+
+def _apply_turnstile_token(token: str, *, cloud: bool = False) -> Any:
+    if cloud:
+        return _inject_yescaptcha_token(token)
+    return _fill_cf_turnstile_token(token)
+
+
 def _try_sync_turnstile(
     log_callback=None,
     cancel_callback=None,
     reason="自动复用 Turnstile",
+    budget=None,
 ) -> bool:
     """主动获取 Turnstile token 并回填；成功返回 True。
 
     优化：先快速读取已有 token，只有 token 为空时才进入完整获取流程。
     避免每次调用都进入 30 秒循环，导致 widget 被 reset 打断。
+    云打码：优先复用本轮已购 token，避免资料页/等 SSO 各扣一次。
     """
     if log_callback:
         log_callback(f"[*] {reason}...")
+    cloud = _cloud_turnstile_enabled()
 
     # 先快速读取已有 token（不 reset，不阻塞）
     try:
@@ -1534,19 +1733,35 @@ try {
         )
         existing = str(existing or "").strip()
         if len(existing) >= 80:
-            synced = _fill_cf_turnstile_token(existing)
+            synced = _apply_turnstile_token(existing, cloud=cloud)
+            if cloud:
+                _stash_cf_token(existing)
             if log_callback:
                 log_callback(f"[*] Turnstile token 已就绪，回填长度={synced}")
             return bool(synced and int(synced or 0) >= 80)
     except Exception:
         pass
 
+    if cloud:
+        stashed = _stashed_cf_token()
+        if stashed:
+            synced = _inject_yescaptcha_token(stashed)
+            if log_callback:
+                log_callback(
+                    f"[*] 复用本轮云打码 token，长度={len(stashed)}，不重复扣点"
+                )
+            return bool(synced and int(synced or 0) >= 80)
+
     # token 为空，进入完整获取流程（被动等待优先，不 reset）
     try:
-        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
+        token = getTurnstileToken(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            budget=budget,
+        )
         if not token:
             return False
-        synced = _fill_cf_turnstile_token(token)
+        synced = _apply_turnstile_token(token, cloud=cloud)
         if log_callback:
             log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
         return bool(synced and int(synced or 0) >= 80)
@@ -1558,25 +1773,212 @@ try {
 
 _turnstile_reset_done = False
 
+_SITEKEY_JS = """
+try {
+  const keys = [];
+  const push = (v) => {
+    v = String(v || '').trim();
+    if (/^0x[0-9A-Za-z_-]{8,}$/.test(v)) keys.push(v);
+  };
+  document.querySelectorAll('[data-sitekey]').forEach((el) => push(el.getAttribute('data-sitekey')));
+  document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').forEach((el) => {
+    const src = String(el.src || '');
+    try {
+      const u = new URL(src);
+      push(u.searchParams.get('sitekey') || u.searchParams.get('k'));
+    } catch (e) {}
+    const m = src.match(/0x4[0-9A-Za-z_-]{8,}/);
+    if (m) push(m[0]);
+  });
+  const html = document.documentElement ? String(document.documentElement.innerHTML || '') : '';
+  const m2 = html.match(/0x4AAAAA[0-9A-Za-z_-]{8,}/);
+  if (m2) push(m2[0]);
+  return keys[0] || '';
+} catch (e) { return ''; }
+"""
 
-def getTurnstileToken(log_callback=None, cancel_callback=None, force_reset=False):
-    """获取 Turnstile token（直接点击 + 轮询等待）。
 
-    Turnstile iframe 内无 checkbox DOM 元素（canvas/overlay 渲染），
-    managed 模式不会自动通过，所以：
-    1. 直接通过 raw_page.frames 定位 frame 并坐标点击
-    2. 轮询等待 token 出现
-    3. 未通过则间隔重试点击
+def _extract_turnstile_sitekey() -> str:
+    try:
+        raw = page.run_js(_SITEKEY_JS)
+        return str(raw or "").strip()
+    except Exception:
+        return ""
+
+
+def _page_href() -> str:
+    try:
+        href = page.run_js("try { return String(location.href || ''); } catch (e) { return ''; }")
+        return str(href or "").strip()
+    except Exception:
+        return ""
+
+
+def _page_user_agent() -> str:
+    try:
+        ua = page.run_js("try { return String(navigator.userAgent || ''); } catch (e) { return ''; }")
+        return str(ua or "").strip()
+    except Exception:
+        return ""
+
+
+def _page_turnstile_action() -> str:
+    try:
+        raw = page.run_js(
+            """
+try {
+  const el = document.querySelector('[data-action], .cf-turnstile, [data-sitekey]');
+  return String((el && el.getAttribute('data-action')) || '');
+} catch (e) { return ''; }
+            """
+        )
+        return str(raw or "").strip()
+    except Exception:
+        return ""
+
+
+def _get_turnstile_token_yescaptcha(
+    log_callback=None,
+    cancel_callback=None,
+    settings=None,
+):
+    """云打码拿 token 并回填。不点击 Turnstile iframe。"""
+    settings = settings or load_turnstile_settings()
+    _ensure_turnstile_page_hooks(log_callback=log_callback)
+    try:
+        existing = page.run_js(
+            """
+try {
+  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    return String(turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch(e) { return ''; }
+            """
+        )
+        existing = str(existing or "").strip()
+        if len(existing) >= 80:
+            _stash_cf_token(existing)
+            _inject_yescaptcha_token(existing)
+            if log_callback:
+                log_callback(f"[*] Turnstile 已通过，token长度={len(existing)}")
+            return existing
+    except Exception:
+        pass
+
+    stashed = _stashed_cf_token()
+    if stashed:
+        _inject_yescaptcha_token(stashed)
+        if log_callback:
+            log_callback(f"[*] 复用本轮云打码 token，长度={len(stashed)}，不重复扣点")
+        return stashed
+
+    sitekey = _extract_turnstile_sitekey() or str(settings.get("sitekey") or DEFAULT_XAI_SITEKEY)
+    website_url = _page_href() or SIGNUP_URL
+    user_agent = _page_user_agent()
+    action = _page_turnstile_action()
+    proxy_url = ""
+    try:
+        proxy_url = str(get_bound_proxy() or "").strip()
+    except Exception:
+        proxy_url = ""
+    provider = str(settings.get("provider") or "yescaptcha")
+    if log_callback:
+        log_callback(
+            f"[*] Turnstile 使用 {provider} sitekey={sitekey[:16]}… url={website_url[:80]}"
+        )
+
+    def _cancel():
+        raise_if_cancelled(cancel_callback)
+
+    if provider == "capsolver":
+        token = solve_turnstile_capsolver(
+            website_url,
+            sitekey,
+            action=action,
+            settings=settings,
+            log=log_callback,
+            cancel=_cancel,
+        )
+    else:
+        token = solve_turnstile_yescaptcha(
+            website_url,
+            sitekey,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            action=action,
+            settings=settings,
+            log=log_callback,
+            cancel=_cancel,
+        )
+    token = str(token or "").strip()
+    if len(token) < 80:
+        raise Exception(f"{provider} 返回的 Turnstile token 无效")
+    _stash_cf_token(token)
+    _inject_yescaptcha_token(token)
+    try:
+        meta = page.run_js(
+            "return {cbs:(window.__grokTsCallbacks||[]).length, hasTs:!!window.turnstile, hooked:!!window.__grokCfHooked};"
+        )
+        hooked = bool(isinstance(meta, dict) and meta.get("hooked"))
+        cbs = int((meta or {}).get("cbs") or 0) if isinstance(meta, dict) else 0
+        if not hooked or cbs < 1:
+            _ensure_turnstile_page_hooks(log_callback=log_callback)
+            _inject_yescaptcha_token(token)
+            meta = page.run_js(
+                "return {cbs:(window.__grokTsCallbacks||[]).length, hasTs:!!window.turnstile, hooked:!!window.__grokCfHooked};"
+            )
+        if log_callback:
+            log_callback(f"[*] Turnstile inject meta={meta}")
+            if isinstance(meta, dict) and not meta.get("hooked"):
+                log_callback("[!] Turnstile widget hook 未挂上，React 可能收不到 token")
+    except Exception:
+        pass
+    return token
+
+
+def getTurnstileToken(log_callback=None, cancel_callback=None, force_reset=False, budget=None):
+    """获取 Turnstile token。
+
+    TURNSTILE_PROVIDER=capsolver / yescaptcha：云打码回填，不点击 iframe。
+    TURNSTILE_PROVIDER=local（默认点击路径）：直接点击 + 轮询等待。
     """
     if active_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
+
+    settings = load_turnstile_settings()
+    provider = str(settings.get("provider") or "")
+    if provider in CLOUD_PROVIDERS:
+        if not str(settings.get("key") or "").strip():
+            raise Exception(f"TURNSTILE_PROVIDER={provider} 但云打码 key 为空")
+        try:
+            return _get_turnstile_token_yescaptcha(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                settings=settings,
+            )
+        except Exception as cloud_exc:
+            if not settings.get("fallback_local"):
+                raise
+            if log_callback:
+                log_callback(f"[!] {provider} 失败，回落本地点击: {cloud_exc}")
 
     click_attempted = False
     last_click_round = -100
     TOTAL_ROUNDS = 20
     POLL_INTERVAL = 2.0
+    try:
+        cap = float(budget) if budget is not None else TURNSTILE_CLICK_BUDGET
+    except (TypeError, ValueError):
+        cap = TURNSTILE_CLICK_BUDGET
+    cap = max(8.0, min(TURNSTILE_CLICK_BUDGET, cap))
+    token_deadline = time.time() + cap
 
     for _ in range(0, TOTAL_ROUNDS):
+        if time.time() >= token_deadline:
+            break
         raise_if_cancelled(cancel_callback)
         try:
             token = page.run_js(
@@ -1738,7 +2140,7 @@ def build_profile():
 def fill_profile_and_submit(timeout=None, log_callback=None, cancel_callback=None):
     """填写资料页姓名/密码并提交。
 
-    timeout 默认 PROFILE_TIMEOUT（45s）。超时按原因抛明确异常：
+    timeout 默认 PROFILE_TIMEOUT（120s）。超时按原因抛明确异常：
     - 资料页 Turnstile 超时...
     - 资料页表单未就绪...
     - 资料页无提交按钮...
@@ -1758,6 +2160,13 @@ def fill_profile_and_submit(timeout=None, log_callback=None, cancel_callback=Non
     form_seen = False
     cf_rounds = 0
     last_probe_log = 0.0
+
+    def _cf_budget():
+        leftover = deadline - time.time() - TURNSTILE_SUBMIT_RESERVE
+        if leftover >= 20:
+            return min(TURNSTILE_CLICK_BUDGET, leftover)
+        leftover = deadline - time.time() - 5
+        return max(8.0, leftover)
 
     def _maybe_log_cf_wait(message, token_len):
         nonlocal last_cf_log_at, last_logged_token_len
@@ -1937,11 +2346,15 @@ return 'filled-no-submit';
                         log_callback=log_callback,
                         cancel_callback=cancel_callback,
                         reason="Cloudflare 验证卡住，开始二次复用 Turnstile",
+                        budget=_cf_budget(),
                     )
                     last_cf_retry_at = time.time()
                     if synced:
                         sleep_with_cancel(0.5, cancel_callback)
                         wait_cf_since = None
+                        # token 到手时资料页总超时经常已经到点，再给一次填表/提交窗口
+                        if time.time() + 8 >= deadline:
+                            deadline = time.time() + 15
                         continue
                 sleep_with_cancel(0.8, cancel_callback)
                 continue
@@ -1987,10 +2400,13 @@ return 'filled-no-submit';
                             log_callback=log_callback,
                             cancel_callback=cancel_callback,
                             reason="资料表单未出，先复用 Turnstile",
+                            budget=_cf_budget(),
                         )
                         last_cf_retry_at = time.time()
                         if synced:
                             wait_cf_since = None
+                            if time.time() + 8 >= deadline:
+                                deadline = time.time() + 15
                     sleep_with_cancel(0.8, cancel_callback)
                     continue
                 if step == "existing-account":
@@ -2071,11 +2487,14 @@ return 'ready-to-submit';
                     log_callback=log_callback,
                     cancel_callback=cancel_callback,
                     reason="提交前仍卡住，自动再次复用 Turnstile",
+                    budget=_cf_budget(),
                 )
                 last_cf_retry_at = time.time()
                 if synced:
                     sleep_with_cancel(0.5, cancel_callback)
                     wait_cf_since = None
+                    if time.time() + 8 >= deadline:
+                        deadline = time.time() + 15
                     continue
             sleep_with_cancel(0.8, cancel_callback)
             continue
@@ -2183,8 +2602,31 @@ btn.focus(); btn.click(); return 'submitted';
     _raise_profile_fail()
 
 
+def sso_wait_seconds(timeout=None) -> int:
+    """Browser-path SSO cookie wait budget, in seconds.
+
+    SSO_WAIT_TIMEOUT env wins when > 0. Otherwise use timeout or the default.
+    A floor keeps createAccount / redirect from being cut off too early.
+    """
+    env_timeout = 0
+    try:
+        env_timeout = int(os.environ.get("SSO_WAIT_TIMEOUT", "0") or "0")
+    except Exception:
+        env_timeout = 0
+    if env_timeout > 0:
+        base = env_timeout
+    elif timeout is None:
+        base = SSO_WAIT_TIMEOUT_DEFAULT
+    else:
+        try:
+            base = int(timeout or SSO_WAIT_TIMEOUT_DEFAULT)
+        except (TypeError, ValueError):
+            base = SSO_WAIT_TIMEOUT_DEFAULT
+    return max(base, SSO_WAIT_TIMEOUT_FLOOR)
+
+
 def wait_for_sso_cookie(
-    timeout=20,
+    timeout=None,
     log_callback=None,
     cancel_callback=None,
     email=None,
@@ -2196,21 +2638,14 @@ def wait_for_sso_cookie(
     那会打断 accounts.x.ai 的 redirect / Set-Cookie 链，导致 grok.com 只剩匿名 cookie。
 
     线上失败主因：资料提交后被甩到 sign-in?redirect=account，
-    hold 3s + 总超时 10s 就硬跳 grok.com → 只有匿名 cookie → sso_timeout。
+    hold 过短 + 总超时过短就硬跳 grok.com → 只有匿名 cookie → sso_timeout。
 
-    策略（短超时 + 主动推进，不硬等）：
+    策略：
       1) 若还在 /sign-up：加长 hold，让 createAccount 跑完，禁止硬跳 sign-in
       2) 落到 sign-in 用 email+password 自动登录（先邮箱再密码）
       3) 仍无 sso 再轻量跳 accounts?redirect=grok-com / grok（最多 1 次）
     """
-    # 环境可覆盖：SSO_WAIT_TIMEOUT=45
-    env_timeout = 0
-    try:
-        env_timeout = int(os.environ.get("SSO_WAIT_TIMEOUT", "0") or "0")
-    except Exception:
-        env_timeout = 0
-    base_timeout = env_timeout or int(timeout or 35)
-    deadline = time.time() + max(base_timeout, 30)
+    deadline = time.time() + sso_wait_seconds(timeout)
     started = time.time()
     last_seen_names = set()
     last_submit_retry = 0.0
@@ -2225,10 +2660,9 @@ def wait_for_sso_cookie(
     grok_nudge_count = 0
     final_no_submit_state = ""
     final_no_submit_since = None
-    final_no_submit_timeout = 8
-    # 短 hold：给 Set-Cookie 留窗口；过早硬跳 grok/sign-in 会打断建号
-    accounts_hold_seconds = 12
-    grok_nudge_min_elapsed = 22
+    final_no_submit_timeout = SSO_FINAL_NO_SUBMIT_TIMEOUT
+    accounts_hold_seconds = SSO_ACCOUNTS_HOLD_SECONDS
+    grok_nudge_min_elapsed = SSO_GROK_NUDGE_MIN_ELAPSED
     max_grok_nudges = 1
     max_signin_attempts = 4
     email_s = str(email or "").strip()

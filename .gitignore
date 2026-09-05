@@ -24,3 +24,15 @@ stickies*.txt
 *.bak*
 *.fixed-keep
 .DS_Store
+*.har
+*.db*
+*.lock
+*.claims/
+*.used
+*.meta.json
+*.reasons.txt
+/*outlook*.txt
+*.zip
+node_modules/
+deploy/rollback-*/
+*.pre-*
