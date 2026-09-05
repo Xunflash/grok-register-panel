@@ -22,8 +22,10 @@ from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_d
 from batch_traffic import read_metrics as read_batch_traffic
 from batch_traffic import read_summary as read_batch_traffic_summary
 from webui.status_snapshot import SnapshotWorker, cached
-from webui.api_projection import etag, paginate, summary
+from webui.api_projection import PageConflict, etag, paginate, summary
 from webui.log_index import LogIndex
+from webui.maintenance_gate import MaintenanceGate
+from webui.log_retention import RotatingPipe, prune_closed_logs
 from runtime_platform import (
     apply_playwright_node_env,
     batch_launch_command,
@@ -834,9 +836,7 @@ def _start_orch_unlocked():
     need = int(c.get("target_cpa") or 0) - now
     ensure_private_dir(LOG_DIR)
     stdout_path = LOG_DIR / "orch100-stdout.log"
-    fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    best_effort_fchmod(fd, 0o600)
-    stdout = os.fdopen(fd, "a", encoding="utf-8")
+    stdout = RotatingPipe(stdout_path)
     stdout.write(
         f"\n--- monitor start {time.strftime('%Y-%m-%dT%H:%M:%SZ')} "
         f"workers={c.get('workers')} captcha={c.get('turnstile_provider')} "
@@ -894,9 +894,7 @@ def _start_batch_only_unlocked():
     c = save_control(c)
     logname = LOG_DIR / f"batch-orch-{time.strftime('%Y%m%d-%H%M%S')}-n{count}.log"
     ensure_private_dir(LOG_DIR)
-    fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    best_effort_fchmod(fd, 0o600)
-    fout = os.fdopen(fd, "w", encoding="utf-8")
+    fout = RotatingPipe(logname)
     try:
         p = subprocess.Popen(
             batch_launch_command(
@@ -937,9 +935,11 @@ def snapshot():
     base_stale = configured_base < 0 or configured_base > cpa
     base = cpa if base_stale else configured_base
     proc = process_running()
+    if not proc.get("running"):
+        LOG_RETENTION_SNAPSHOT()
     control = load_control()
     bl = read_blacklist()
-    bl_err = blacklist_update_errors()
+    bl_err = BLACKLIST_ERROR_SNAPSHOT()
     try:
         rates = STATS_SNAPSHOT().get("rates") or {}
     except Exception:
@@ -1005,12 +1005,16 @@ def snapshot():
 
 
 STATUS_WORKER = SnapshotWorker(snapshot)
+MAINTENANCE = MaintenanceGate()
 PROXY_SNAPSHOT = cached(3)(read_proxy_pool)
 STATS_SNAPSHOT = cached(30)(success_stats)
+BLACKLIST_ERROR_SNAPSHOT = cached(30)(blacklist_update_errors)
+RECOVERY_SNAPSHOT = cached(10)(recovery_status)
+LOG_RETENTION_SNAPSHOT = cached(60)(lambda: prune_closed_logs(LOG_DIR, protected=[discover_log()] if discover_log() else []))
 
 
 HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-status-v2="0">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -2286,6 +2290,9 @@ HTML = r"""<!DOCTYPE html>
           <p class="proxy-view-subtitle">凭据仅保存在本机，注册中途不会切换出口</p>
         </div>
         <span class="proxy-job mono" id="proxy-updated">等待读取</span>
+        <button id="proxy-prev" onclick="changeProxyPage(-1)">上一页</button>
+        <span id="proxy-page">1</span>
+        <button id="proxy-next" onclick="changeProxyPage(1)">下一页</button>
       </div>
 
       <div class="proxy-summary" id="proxy-summary" aria-label="代理池状态">
@@ -2896,14 +2903,21 @@ function loadTokenField() {
     try { el.value = localStorage.getItem("MONITOR_TOKEN") || window.MONITOR_TOKEN || ""; } catch (e) {}
   }
 }
+let statusV2Enabled = document.documentElement.dataset.statusV2 === "1";
+const responseCache = new Map();
 async function api(path, opts) {
   opts = Object.assign({}, opts || {});
   const authHelp = opts.authHelp !== false;
   delete opts.authHelp;
+  const cachedResponse = opts.revalidate ? responseCache.get(path) : null;
+  const revalidate = opts.revalidate;
+  delete opts.revalidate;
   const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   const tok = getToken();
   if (tok) headers["Authorization"] = "Bearer " + tok;
+  if (cachedResponse && cachedResponse.token === tok) headers["If-None-Match"] = cachedResponse.tag;
   const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 304 && cachedResponse && cachedResponse.token === tok) return cachedResponse.data;
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     if (r.status === 401) {
@@ -2913,6 +2927,7 @@ async function api(path, opts) {
     throw new Error(j.error || j.detail || r.statusText || "request failed");
   }
   if (j && j.ok === false) throw new Error(j.error || j.message || "request failed");
+  if (revalidate && r.headers.get("ETag")) responseCache.set(path, { tag: r.headers.get("ETag"), token: tok, data: j });
   return j;
 }
 function proxyStatusLabel(status) {
@@ -3000,10 +3015,15 @@ function renderProxyPool(data) {
     </tr>`;
   }).join("") : '<tr><td colspan="7" class="proxy-empty">代理池为空，可在上方导入单条或批量代理</td></tr>';
 }
+let proxyPage = 1;
+function changeProxyPage(delta) { proxyPage = Math.max(1, proxyPage + delta); refreshProxies(false); }
 async function refreshProxies(authHelp = false) {
   try {
-    const data = await api("/api/proxies?_=" + Date.now(), { authHelp });
+    const data = await api("/api/proxies?page=" + proxyPage + "&page_size=25", { authHelp });
     renderProxyPool(data);
+    document.getElementById("proxy-page").textContent = proxyPage + " / " + Math.max(1, Math.ceil(data.total / 25));
+    document.getElementById("proxy-prev").disabled = proxyPage <= 1;
+    document.getElementById("proxy-next").disabled = proxyPage * 25 >= data.total;
     if (!data.ok && data.error) setMsg("proxy-msg", data.error, "err");
   } catch (e) {
     const message = String(e.message || e);
@@ -3369,7 +3389,16 @@ async function refresh() {
   if (refreshPending || document.hidden) return;
   refreshPending = true;
   try {
-    const d = await api("/api/status?_=" + Date.now(), { authHelp: false });
+    let d;
+    try {
+      d = await api(statusV2Enabled ? "/api/status/v2" : "/api/status", { authHelp: false, revalidate: true });
+      if (statusV2Enabled && d.schema_version !== 2) throw new Error("incomplete status contract");
+    } catch (error) {
+      if (!statusV2Enabled || String(error.message).includes("令牌")) throw error;
+      statusV2Enabled = false;
+      d = await api("/api/status", { authHelp: false });
+    }
+    if (d.schema_version === 2) d.ts_human = new Date((d.sampled_at || Date.now() / 1000) * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
     last = d;
     render(d);
     refreshDelay = d.process && d.process.running ? 2000 : 10000;
@@ -3853,7 +3882,7 @@ function render(d) {
     "尝试 " + (d.done_attempts ?? 0) + " / " + (on ? "进程运行中" : "未运行")
     + (d.ended ? " / 结束：成功 " + d.ended.success + "，失败 " + d.ended.fail : "");
 
-  renderBlacklist(d.blacklist, d.blacklist_update);
+  if (d.schema_version !== 2) renderBlacklist(d.blacklist, d.blacklist_update);
   // 2s 快照：只更新本批/CPA，绝不清空 jsonl / 按日表
   renderStats({
     cpa: d.cpa,
@@ -3873,8 +3902,8 @@ function render(d) {
   document.getElementById("fails").innerHTML = fk.length ? fk.map(([k, v]) =>
     `<div class="chip"><span>${esc(k)}</span><b class="fail">${v}</b></div>`
   ).join("") : '<span style="color:var(--muted)">暂无失败</span>';
-  okRowsCache = Array.isArray(d.recent_ok) ? d.recent_ok.slice() : [];
-  failRowsCache = Array.isArray(d.recent_fail) ? d.recent_fail.slice() : [];
+  if (Array.isArray(d.recent_ok)) okRowsCache = d.recent_ok.slice();
+  if (Array.isArray(d.recent_fail)) failRowsCache = d.recent_fail.slice();
   // 新数据到来时，若当前页越界则收回最后一页；用户正在翻页时尽量保留页码
   renderOkPage();
   renderFailPage();
@@ -3941,22 +3970,42 @@ function renderFailPage() {
 }
 
 document.getElementById("ok-prev").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.ok = Math.max(1, logPages.ok - 1); refreshLogPages(); return; }
   okPage = Math.max(1, okPage - 1);
   renderOkPage();
 });
 document.getElementById("ok-next").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.ok++; refreshLogPages(); return; }
   okPage += 1;
   renderOkPage();
 });
 document.getElementById("fail-prev").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.fail = Math.max(1, logPages.fail - 1); refreshLogPages(); return; }
   failPage = Math.max(1, failPage - 1);
   renderFailPage();
 });
 document.getElementById("fail-next").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.fail++; refreshLogPages(); return; }
   failPage += 1;
   renderFailPage();
 });
 
+const logPages = { ok: 1, fail: 1 };
+let logPagesPending = false;
+async function refreshLogPages() {
+  if (!statusV2Enabled || document.hidden || logPagesPending) return;
+  logPagesPending = true;
+  try {
+    for (const kind of ["ok", "fail"]) {
+      const data = await api(`/api/logs?kind=${kind}&page=${logPages[kind]}&page_size=10`, { authHelp: false });
+      if (kind === "ok") { okRowsCache = data.items; okPage = 1; renderOkPage(); }
+      else { failRowsCache = data.items; failPage = 1; renderFailPage(); }
+      document.getElementById(kind + "-prev").disabled = logPages[kind] <= 1;
+      document.getElementById(kind + "-next").disabled = logPages[kind] * 10 >= data.total;
+      document.getElementById(kind + "-page-meta").textContent = `共 ${data.total} 条 · 第 ${logPages[kind]} 页`;
+    }
+  } catch {} finally { logPagesPending = false; }
+}
 syncThemeButtons();
 initHelp();
 loadTokenField();
@@ -3965,6 +4014,8 @@ async function pollStatus() {
   setTimeout(pollStatus, refreshDelay);
 }
 pollStatus();
+refreshLogPages();
+setInterval(refreshLogPages, 10000);
 // 完整成功统计：启动拉一次，之后每 30s 刷新（避免 2s 轮询冲掉）
 refreshStats(false);
 setInterval(() => refreshStats(false), 30000);
@@ -3986,6 +4037,11 @@ setInterval(() => {
 </body>
 </html>
 """
+
+
+from webui.static_assets import compile_assets
+
+SERVED_HTML, STATIC_ASSETS = compile_assets(HTML.replace('data-status-v2="0"', 'data-status-v2="1"' if PANEL_STATUS_V2 else 'data-status-v2="0"'), FONT_ASSETS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4080,7 +4136,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self._send(200, SERVED_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if u.path in STATIC_ASSETS:
+            body, content_type = STATIC_ASSETS[u.path]
+            self._send(200, body, content_type, "public, max-age=31536000, immutable")
             return
         if u.path in FONT_ASSETS:
             path = FONT_ASSETS[u.path]
@@ -4095,6 +4155,20 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
+        if u.path == "/api/maintenance":
+            if self._require_read():
+                self._maintenance_status()
+            return
+        if u.path == "/api/quarantines":
+            if not self._require_read():
+                return
+            try:
+                from webui.guard_projection import quarantines
+
+                self._json(200, quarantines(_read_json(ROOT / "config.json", {}) or {}, parse_qs(u.query).get("page", ["1"])[0]))
+            except Exception:
+                self._json(503, {"error": "quarantine status unavailable"})
+            return
         if u.path in ("/api/status/v2", "/api/logs"):
             if not self._require_read():
                 return
@@ -4107,7 +4181,11 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     page = query.get("page", ["1"])[0]
                     size = query.get("page_size", ["40"])[0]
-                    self._json(200, paginate({"items": value.get("recent_fail", []) + value.get("recent_ok", [])}, page, size))
+                    kind = query.get("kind", ["all"])[0]
+                    rows = value.get("recent_" + kind, []) if kind in {"ok", "fail"} else value.get("recent_fail", []) + value.get("recent_ok", [])
+                    self._json(200, paginate({"items": rows}, page, size, query.get("generation", [None])[0]))
+                except PageConflict:
+                    self._json(409, {"error": "snapshot changed; restart pagination"})
                 except (ValueError, TypeError):
                     self._json(400, {"error": "invalid pagination"})
                 return
@@ -4152,7 +4230,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/recovery":
             try:
-                self._json(200, recovery_status())
+                self._json(200, RECOVERY_SNAPSHOT())
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -4173,9 +4251,11 @@ class Handler(BaseHTTPRequestHandler):
                 data = PROXY_SNAPSHOT()
                 data["resin_sync"] = resin_sync_status()
                 query = parse_qs(u.query)
-                if "page" in query:
-                    data = paginate(data, query["page"][0], query.get("page_size", ["50"])[0])
+                pagination = paginate(data, query.get("page", ["1"])[0], query.get("page_size", ["50"])[0], query.get("generation", [None])[0])
+                data = {**data, **pagination}
                 self._json(200, data)
+            except PageConflict:
+                self._json(409, {"ok": False, "error": "snapshot changed; restart pagination"})
             except (ValueError, TypeError):
                 self._json(400, {"ok": False, "error": "invalid pagination"})
             except Exception as e:
@@ -4196,6 +4276,37 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self._require_write():
+            return
+        if urlparse(self.path).path == "/api/maintenance":
+            try:
+                MAINTENANCE.set_paused(self._read_body().get("paused"))
+            except (ValueError, OverflowError):
+                self._json(400, {"error": "paused must be a boolean"})
+                return
+            self._maintenance_status()
+            return
+        if not MAINTENANCE.begin():
+            self._json(503, {"error": "maintenance", "reason_code": "capacity"})
+            return
+        try:
+            self._dispatch_POST()
+        finally:
+            MAINTENANCE.end()
+
+    def _maintenance_status(self):
+        from webui.proxy_store import proxy_test_status
+
+        state = MAINTENANCE.snapshot()
+        try:
+            jobs = (process_running(), recovery_status(), sso_state_status(), proxy_test_status())
+            state["background_active"] = sum(bool(job.get("running")) for job in jobs)
+            state["drained"] = state["drained"] and not state["background_active"]
+            self._json(200, state)
+        except Exception:
+            self._json(503, {"paused": state["paused"], "drained": False, "error": "activity unknown"})
+
+    def _dispatch_POST(self):
         u = urlparse(self.path)
         # All POST endpoints require MONITOR_TOKEN
         if not self._require_write():
@@ -4413,6 +4524,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_PATCH(self):
+        if not self._require_write():
+            return
+        if not MAINTENANCE.begin():
+            self._json(503, {"error": "maintenance"})
+            return
+        try:
+            self._dispatch_PATCH()
+        finally:
+            MAINTENANCE.end()
+
+    def _dispatch_PATCH(self):
         u = urlparse(self.path)
         proxy_match = re.fullmatch(r"/api/proxies/([a-f0-9]{20})", u.path)
         domain_match = re.fullmatch(r"/api/email-domains/([a-f0-9]{20})", u.path)
@@ -4441,6 +4563,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": redact_log_line(str(exc))})
 
     def do_DELETE(self):
+        if not self._require_write():
+            return
+        if not MAINTENANCE.begin():
+            self._json(503, {"error": "maintenance"})
+            return
+        try:
+            self._dispatch_DELETE()
+        finally:
+            MAINTENANCE.end()
+
+    def _dispatch_DELETE(self):
         u = urlparse(self.path)
         proxy_match = re.fullmatch(r"/api/proxies/([a-f0-9]{20})", u.path)
         domain_match = re.fullmatch(r"/api/email-domains/([a-f0-9]{20})", u.path)

@@ -22,20 +22,21 @@ mutation, health and redaction. `batch_traffic.py` owns traffic accounting.
 - Existing UI poll avoids overlap/hidden-tab work; running 2s, idle 10s, error
   backoff up to 30s. Fonts use one-day caching, not immutable unversioned caching.
 
-## Remaining Before Activation
+## Compatibility and Release Gate
 
 Legacy `/api/status` and unpaged proxies are retained for existing UI consumers.
 The current UI still reads the legacy status shape, even with a shared producer;
-it must not be described as fully switched to the small v2 summary. Add complete
-traffic/rates/control projections, fetch details separately, and fall back on
-incomplete v2 state. A warmup 503 is expected while the worker has no snapshot.
+it must not be described as fully switched to the small v2 summary without the
+production fallback check. The current source includes complete bounded
+traffic/rates/control projections and falls back on incomplete v2 state. A
+warmup 503 is expected while the worker has no snapshot.
 
 Cursor generation under concurrent updates, default proxy pagination, quarantine
-adapter, hashed immutable static assets and producer-aware log rotation remain.
-Never truncate a live log behind an open writer. Retention must constrain age and
-total bytes without deleting active logs or changing accounting source data.
-Statistics still use the existing full history scan on cache refresh; avoid
-claiming completely incremental statistics or the final CPU target yet.
+adapter, hashed immutable static assets and producer-aware log rotation are
+implemented in the current source. Never truncate a live log behind an open
+writer. Retention constrains age and total bytes without deleting active logs or
+changing accounting source data. Statistics still use the existing full history
+scan on cache refresh; the final CPU target requires production measurement.
 
 ## Tests
 
@@ -44,4 +45,4 @@ rotation/truncation, summary redaction/size, pagination, ETag changes, concurren
 refresh, stale last-good value. `tests/test_monitor_http.py` retains legacy auth
 and operator-action behavior. `tests/test_status_v2_http.py` verifies auth before
 304, health anonymity, warmup and invalid pages. Browser responsive parity, rotation and
-30-minute resource tests remain release gates in C.2-C.5.
+30-minute resource tests remain production release gates.

@@ -8,5 +8,6 @@ It does not classify Guard samples or lease API accounts.
 Acceptance: status p95 <150ms, summary <20KB, proxy page <100KB, sustained
 RSS <120MB and idle CPU <30% of a comparable measured baseline. No performance
 claim is accepted without running/idle measurements and a 30-minute observation.
-The existing panel and registration behavior remain default until v2 UI parity,
-pagination and rotation are tested. See RFC-003 for current implementation limits.
+The existing panel and registration behavior remain default until the staged
+production fallback, pagination and rotation checks pass. See RFC-003 for the
+implementation contract and release measurements.

@@ -8,7 +8,9 @@ Canonical outcome/decision metadata is defined in the sibling Guard RFC-001.
 objects. Raw logs and full proxies are not part of summary. Operational GETs
 require the existing monitor token when configured; write APIs always require it.
 Production must configure a strong token. Health and static shell reveal no
-runtime identities. Pagination details require the same authentication.
+runtime identities. Pagination details require the same authentication. The
+maintenance endpoint uses the same write boundary and reports active/drained
+state.
 
 State version is a content digest, not a sampling timestamp. `sampled_at` and
 `stale` let readers distinguish freshness from unchanged content. ETag must never

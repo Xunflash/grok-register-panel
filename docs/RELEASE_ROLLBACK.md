@@ -10,6 +10,7 @@ panel is a user systemd service at `/data/claw-relocated/grok-register-panel`;
 health is port 1114 `/api/health`. Data/credentials remain outside Git. Preserve
 the existing interpreter, browser runtime, UMask=0077 and external environment.
 
-PANEL_STATUS_V2 defaults to 0. Do not enable until all C Stories and frontend
-compatibility tests pass. Snapshot static check is not a completed restore drill.
-Current script limitations and release blockers are in the canonical runbook.
+PANEL_STATUS_V2 defaults to 0 during the first production restart. Enable only
+after API/Guard health, authenticated v2 fallback and real-data pagination pass.
+Snapshot static check is not a completed restore drill. Current script limits and
+the 30-minute resource gate are in the canonical runbook.

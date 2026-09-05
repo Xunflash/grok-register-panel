@@ -22,7 +22,7 @@
 - [ ] `PANEL_INCLUDE_TAIL=0` in the production environment.
 - [ ] The monitor binds to the intended loopback, LAN, or Tailscale address only.
 - [ ] Blacklist state was migrated before replacing legacy source files.
-- [ ] Pending SSO counts and recovery controls were checked without starting a job.
+- [ ] SSO counts and recovery controls were checked without starting a job.
 - [ ] Desktop and mobile screenshots were reviewed in light and dark themes.
 - [ ] Panel-launched jobs receive `GROK_STATIC_ASSET_CACHE=1` unless explicitly disabled.
 - [ ] xAI signup precheck failure exits once without supervisor or orchestrator restart.

@@ -106,10 +106,10 @@ def kill_batch() -> None:
 
 
 def start_batch(count: int):
+    from webui.log_retention import RotatingPipe
+
     logname = LOG_DIR / f"batch-orch-{time.strftime('%Y%m%d-%H%M%S')}-n{count}.log"
-    fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    best_effort_fchmod(fd, 0o600)
-    fout = os.fdopen(fd, "w", encoding="utf-8")
+    fout = RotatingPipe(logname)
     try:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"

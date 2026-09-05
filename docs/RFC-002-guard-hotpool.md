@@ -9,6 +9,8 @@ exit checks before a registration attempt; fail clearly on a denied/exhausted
 exit, never rotate an active account identity mid-flow. Email/OTP failures do
 not blacklist exits. Keep one proxy for the account lifecycle.
 
-The planned risk_pause_enabled control, separate outcome counters and shared
-maintenance gate remain in Story B.5/A.3. Do not advertise these as deployed.
-Full trusted-pool rules and lease design belong to Guard RFC-002, not the panel.
+The panel consumes the shared maintenance boundary and risk-pause projection;
+it does not implement risk classification, trusted-pool qualification or API
+leases. Full trusted-pool rules and lease design belong to Guard RFC-002, not
+the panel. Production rollout keeps strict admission and risk pause disabled
+until the measured observation gate passes.
