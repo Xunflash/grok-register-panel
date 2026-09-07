@@ -235,6 +235,8 @@ def load_control() -> dict:
         c.setdefault("mode", "orch")  # orch | batch
         c.setdefault("turnstile_provider", "yescaptcha")
         c.setdefault("registration_scheme", "browser")
+        c.setdefault("stop_min_accounts", 10)
+        c.setdefault("stop_min_success_rate", 65)
         return c
 
 
@@ -249,6 +251,8 @@ def save_control(updates: dict) -> dict:
         "target_cpa",
         "turnstile_provider",
         "registration_scheme",
+        "stop_min_accounts",
+        "stop_min_success_rate",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -269,6 +273,15 @@ def save_control(updates: dict) -> dict:
             c["add_count"] = max(1, min(2000, int(c.get("add_count", 40))))
         except Exception:
             c["add_count"] = 40
+        try:
+            from success_stop import normalize_success_stop
+
+            stop_cfg = normalize_success_stop(c)
+            c["stop_min_accounts"] = int(stop_cfg["stop_min_accounts"])
+            c["stop_min_success_rate"] = float(stop_cfg["stop_min_success_rate"])
+        except Exception:
+            c["stop_min_accounts"] = 10
+            c["stop_min_success_rate"] = 65
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
         provider = str(c.get("turnstile_provider") or "yescaptcha").strip().lower()
         if provider in {"yes", "cloud", "云", "云打码"}:
@@ -2163,6 +2176,12 @@ HTML = r"""<!DOCTYPE html>
       <div class="field"><label for="risk_pause">风控阈值</label>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>
       </div>
+      <div class="field"><label for="stop_min_accounts">停机最少账号</label>
+        <input type="number" id="stop_min_accounts" min="1" max="5000" value="10" title="完成次数（成功+失败）超过该值后才检查成功率"/>
+      </div>
+      <div class="field"><label for="stop_min_success_rate">停机最低成功率%</label>
+        <input type="number" id="stop_min_success_rate" min="0" max="100" step="0.1" value="65" title="完成次数超过最少账号且成功率低于该值时停止任务"/>
+      </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
         <button class="danger" id="btn-stop" onclick="doStop()">停止任务</button>
@@ -3418,11 +3437,17 @@ async function refresh() {
 }
 function fillControl(d) {
   const c = d.control || {};
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) return;
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) return;
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
   if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
+  if (c.stop_min_accounts != null && document.getElementById("stop_min_accounts")) {
+    document.getElementById("stop_min_accounts").value = c.stop_min_accounts;
+  }
+  if (c.stop_min_success_rate != null && document.getElementById("stop_min_success_rate")) {
+    document.getElementById("stop_min_success_rate").value = c.stop_min_success_rate;
+  }
   if (c.mode) document.getElementById("mode").value = c.mode;
   if (c.turnstile_provider && document.getElementById("turnstile_provider")) {
     document.getElementById("turnstile_provider").value = c.turnstile_provider;
@@ -3437,6 +3462,8 @@ function controlBody() {
     batch_count: Number(document.getElementById("batch_count").value || 40),
     add_count: Number((document.getElementById("add_count") || {}).value || 40),
     risk_pause: Number(document.getElementById("risk_pause").value || 10),
+    stop_min_accounts: Number((document.getElementById("stop_min_accounts") || {}).value || 10),
+    stop_min_success_rate: Number((document.getElementById("stop_min_success_rate") || {}).value || 65),
     mode: document.getElementById("mode").value || "orch",
     turnstile_provider: (document.getElementById("turnstile_provider") || {}).value || "capsolver",
     registration_scheme: (document.getElementById("registration_scheme") || {}).value || "browser",

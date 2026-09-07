@@ -8,7 +8,7 @@ from webui.security_utils import redact_log_line
 
 
 SCALARS = {"base_cpa", "base_cpa_stale", "cpa", "cpa_delta", "target", "done_attempts", "progress_pct", "success_rate", "rate_per_min", "eta", "workers", "ok", "fail", "domain", "skip", "bot0", "bot1", "bfs"}
-CONTROL = {"workers", "batch_count", "add_count", "risk_pause", "mode", "turnstile_provider", "registration_scheme"}
+CONTROL = {"workers", "batch_count", "add_count", "risk_pause", "mode", "turnstile_provider", "registration_scheme", "stop_min_accounts", "stop_min_success_rate"}
 CONTROL_ENUMS = {"mode": {"orch", "batch"}, "turnstile_provider": {"capsolver", "yescaptcha", "local"}, "registration_scheme": {"browser", "protocol"}}
 TRAFFIC = {"running", "bytes_up", "bytes_down", "bytes_total", "connections", "active_connections", "metered_proxies", "unmetered_proxies", "target", "workers", "successful_accounts", "batch_count", "completed_batches", "bytes_per_batch", "bytes_per_success", "total_batches"}
 
@@ -26,7 +26,15 @@ def safe_scalar(value):
 def summary(value):
     result = {key: safe_scalar(value[key]) for key in SCALARS if key in value}
     result["process"] = numeric_fields(value.get("process", {}), {"running", "pid", "batch_pid", "orch_pid", "orch_running", "batch_running"})
-    result["control"] = {key: item for key, item in value.get("control", {}).items() if key in CONTROL and isinstance(item, (bool, int))}
+    result["control"] = {
+        key: item
+        for key, item in value.get("control", {}).items()
+        if key in CONTROL
+        and (
+            isinstance(item, (bool, int))
+            or (key == "stop_min_success_rate" and isinstance(item, float))
+        )
+    }
     for key, choices in CONTROL_ENUMS.items():
         if value.get("control", {}).get(key) in choices:
             result["control"][key] = value["control"][key]

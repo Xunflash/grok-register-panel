@@ -18,6 +18,7 @@ from runtime_platform import (
     runtime_python,
 )
 from retry_policy import PRECHECK_EXIT_CODE, orchestrator_failure_limit
+from success_stop import load_success_stop_settings, should_stop_low_success
 from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
@@ -188,6 +189,17 @@ def count_ok(logpath: Path) -> int:
     return len(re.findall(r"\[\+\] 注册成功:", logpath.read_text(errors="replace")))
 
 
+def count_fail(logpath: Path) -> int:
+    if not logpath.exists():
+        return 0
+    text = logpath.read_text(errors="replace")
+    return (
+        len(re.findall(r"\[-\] 失败", text))
+        + len(re.findall(r"\[-\] 域名拒绝", text))
+        + len(re.findall(r"\[-\] 卡住跳过", text))
+    )
+
+
 def analyze_risks_and_expand(logpath: Path) -> list:
     """Add ASN to blacklist if risk-only and enough samples. Bounded time."""
     added = []
@@ -331,12 +343,20 @@ def main():
                 alive = False
             risks = count_risk(logpath)
             oks = count_ok(logpath)
+            fails = count_fail(logpath)
             delta = cpa_count() - BASE0
-            log(f"  mon ok={oks} risk={risks} cpa_delta={delta}/100 alive={alive}")
+            log(f"  mon ok={oks} fail={fails} risk={risks} cpa_delta={delta}/100 alive={alive}")
             if cpa_count() >= TARGET_CPA:
                 log("TARGET reached")
                 kill_batch()
                 break
+            stop_low, stop_reason = should_stop_low_success(
+                oks, fails, load_success_stop_settings(CONTROL_FILE)
+            )
+            if stop_low:
+                log(f"  HIT {stop_reason}")
+                kill_batch()
+                return
             if risks >= RISK_PAUSE:
                 log(f"  HIT {RISK_PAUSE} 注册风控 rejects (risk={risks}), pause+blacklist")
                 kill_batch()

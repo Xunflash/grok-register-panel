@@ -55,6 +55,7 @@ from retry_policy import (
     should_count_as_failure,
     slot_retries,
 )
+from success_stop import load_success_stop_settings, should_stop_low_success
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -482,6 +483,21 @@ def record_register_result(
             except Exception:
                 pass
     return rec
+
+
+def apply_success_stop_if_needed(ok, fail, log_callback=None, stop_fn=None) -> bool:
+    """Stop the current run when completed attempts exceed the UI success floor."""
+    stop, reason = should_stop_low_success(ok, fail, load_success_stop_settings())
+    if not stop:
+        return False
+    if log_callback:
+        try:
+            log_callback(f"[!] {reason}")
+        except Exception:
+            pass
+    if callable(stop_fn):
+        stop_fn()
+    return True
 
 
 def classify_failure(exc) -> str:
@@ -3862,6 +3878,7 @@ class GrokRegisterGUI:
             if not hasattr(self, "fail_stats") or self.fail_stats is None:
                 self.fail_stats = empty_fail_stats()
             self.fail_stats[kind] = self.fail_stats.get(kind, 0) + 1
+        self._maybe_stop_low_success()
         return kind
 
     def _record_success(self):
@@ -3871,6 +3888,15 @@ class GrokRegisterGUI:
                 self.success_count += 1
         else:
             self.success_count += 1
+        self._maybe_stop_low_success()
+
+    def _maybe_stop_low_success(self):
+        apply_success_stop_if_needed(
+            self.success_count,
+            self.fail_count,
+            log_callback=self.log,
+            stop_fn=self.stop_registration,
+        )
 
     def _set_running_ui(self, running):
         if self._queue_ui_call(self._set_running_ui, running):
@@ -4461,6 +4487,9 @@ def run_registration_cli(count):
         kind = classify_failure(exc)
         fail_count += 1
         fail_stats[kind] = fail_stats.get(kind, 0) + 1
+        apply_success_stop_if_needed(
+            success_count, fail_count, log_callback=cli_log, stop_fn=controller.stop
+        )
         return kind
 
     if workers > 1:
@@ -4477,6 +4506,21 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             rotate_idx = 0
+
+            def _publish_cli(ok_delta=0, fail_delta=0):
+                with stats_lock:
+                    if ok_delta:
+                        shared["success"] += int(ok_delta)
+                    if fail_delta:
+                        shared["fail"] += int(fail_delta)
+                    ok_n = shared["success"]
+                    fail_n = shared["fail"]
+                apply_success_stop_if_needed(
+                    ok_n,
+                    fail_n,
+                    log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                    stop_fn=controller.stop,
+                )
 
             def _rotate_proxy(_reason: str = "") -> None:
                 nonlocal rotate_idx
@@ -4499,6 +4543,7 @@ def run_registration_cli(count):
                         f"[W{wid+1}] [-] 没有可用代理，停止该 worker: "
                         f"{redact_sensitive_log_line(str(proxy_exc))}"
                     )
+                    _publish_cli(fail_delta=n)
                     return
                 set_thread_proxy(px)
                 cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
@@ -4536,6 +4581,7 @@ def run_registration_cli(count):
                     if not booted:
                         local_fail = n
                         local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
+                        _publish_cli(fail_delta=n)
                         mark_slot_completed(n)
                         cli_log(
                             f"[W{wid+1}] [-] 浏览器启动失败，{n} 个任务均记为失败: "
@@ -4604,6 +4650,7 @@ def run_registration_cli(count):
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
                         local_success += 1
+                        _publish_cli(ok_delta=1)
                         mark_successful_account()
                         i += 1
                         retry = 0
@@ -4634,6 +4681,7 @@ def run_registration_cli(count):
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
+                        _publish_cli(fail_delta=1)
                         i += 1
                         retry = 0
                         settle_outcome = "dead"
@@ -4658,6 +4706,7 @@ def run_registration_cli(count):
                             kind = classify_failure(exc)
                             local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                             local_fail += 1
+                            _publish_cli(fail_delta=1)
                             i += 1
                             retry = 0
                             cli_log(
@@ -4757,6 +4806,7 @@ def run_registration_cli(count):
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
+                        _publish_cli(fail_delta=1)
                         i += 1
                         retry = 0
                         if kind in (FAIL_DOMAIN, FAIL_RISK, FAIL_CPA):
@@ -4847,6 +4897,7 @@ def run_registration_cli(count):
                                     local_fail_stats[FAIL_BROWSER] = (
                                         local_fail_stats.get(FAIL_BROWSER, 0) + remaining
                                     )
+                                    _publish_cli(fail_delta=remaining)
                                     cli_log(
                                         f"[W{wid+1}] [-] 健康代理已耗尽，停止该 worker: "
                                         f"{redact_sensitive_log_line(str(boot_exc))}"
@@ -4882,6 +4933,7 @@ def run_registration_cli(count):
                                                 local_fail_stats[FAIL_BROWSER] = (
                                                     local_fail_stats.get(FAIL_BROWSER, 0) + remaining
                                                 )
+                                                _publish_cli(fail_delta=remaining)
                                                 cli_log(
                                                     f"[W{wid+1}] [-] 健康代理已耗尽，停止该 worker: "
                                                     f"{redact_sensitive_log_line(str(boot2))}"
@@ -4903,8 +4955,6 @@ def run_registration_cli(count):
                     pass
                 release_proxy_lease(wid)
                 with stats_lock:
-                    shared["success"] += local_success
-                    shared["fail"] += local_fail
                     for k, v in local_fail_stats.items():
                         shared["fail_stats"][k] = shared["fail_stats"].get(k, 0) + v
 
@@ -5014,6 +5064,9 @@ def run_registration_cli(count):
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 mark_successful_account()
+                apply_success_stop_if_needed(
+                    success_count, fail_count, log_callback=cli_log, stop_fn=controller.stop
+                )
                 retry_count_for_slot = 0
                 i += 1
                 if cpa_ok:
