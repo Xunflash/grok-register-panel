@@ -75,6 +75,10 @@ def test_compact_overview_density():
     assert '<section class="card panel rate-panel">' in mon
     assert '@media (min-width: 1121px)' in mon
     assert '.control-panel .control-actions button {' in mon
+    assert 'grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(5, minmax(110px, .7fr));' in mon
+    actions = re.search(r'\.control-actions \{([^}]+)\}', mon)
+    assert actions and 'grid-column: 1 / -1;' in actions.group(1)
+    assert 'minmax(258px, auto)' not in mon
 
 def test_help_and_faq_module():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
@@ -161,6 +165,7 @@ def test_control_buttons_optimistic_and_save_id():
     assert 'document.getElementById("btn-start").disabled = false' not in html
     assert 'document.getElementById("btn-stop").disabled = false' not in html
     assert '对照面板近1小时成功率' in html
+    assert 'grid-column: 1 / -1;' in html
     assert 'STATUS_WORKER.refresh()' in mon
     assert 'should_stop_from_hour_window' in (ROOT / 'run_until_100.py').read_text(encoding='utf-8')
     assert 'should_stop_from_hour_window' in (ROOT / 'grok_register_ttk.py').read_text(encoding='utf-8')

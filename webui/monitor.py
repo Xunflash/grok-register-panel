@@ -1263,15 +1263,22 @@ HTML = r"""<!DOCTYPE html>
   .list-pager button:disabled { opacity: .4; cursor: not-allowed; }
   .control-grid {
     display: grid;
-    grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(4, minmax(100px, .55fr)) minmax(258px, auto);
+    grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(5, minmax(110px, .7fr));
     gap: 12px;
     align-items: end;
   }
   .control-actions {
     display: flex;
     justify-content: flex-end;
+    align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
+    grid-column: 1 / -1;
+    min-width: 0;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
   }
+  .control-actions button { flex: 0 0 auto; }
   .control-panel { padding: 12px 16px; }
   .control-panel .section-head { min-height: 24px; margin-bottom: 8px; }
   .control-panel .msg:empty { display: none; }
