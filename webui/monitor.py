@@ -3940,8 +3940,8 @@ function render(d) {
     sync.className = "badge";
   }
   document.getElementById("ctrl-status").textContent = on ? "运行中" : "空闲";
-  if (!controlBusy) syncControlButtons(on);
   fillControl(d);
+  if (!controlBusy) syncControlButtons(on);
 
   const traffic = d.traffic || {};
   const hasTrafficBatch = !!traffic.batch_id;
