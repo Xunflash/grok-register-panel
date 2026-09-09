@@ -145,12 +145,18 @@ def test_control_buttons_optimistic_and_save_id():
     assert 'id="btn-start"' in html
     assert 'id="btn-stop"' in html
     assert 'id="btn-save"' in html
+    assert 'id="btn-start" onclick="doStart()" disabled' in html
+    assert 'id="btn-stop" onclick="doStop()" disabled' in html
+    assert 'id="btn-save" onclick="saveCtrl()" disabled' in html
     assert 'function processIsRunning(d)' in html
     assert 'function bustStatusCache()' in html
     assert 'function syncControlButtons(running)' in html
     assert 'let controlBusy = "";' in html
     assert 'let optimisticRunning = null;' in html
     assert 'let pendingControl = null;' in html
+    assert 'let controlHydrated = false;' in html
+    assert '状态尚未加载，请稍后再保存' in html
+    assert '状态尚未加载，请稍后再启动' in html
     assert 'p.running || p.orch_running || p.batch_running' in html
     assert 'document.getElementById("btn-start").disabled = false' not in html
     assert 'document.getElementById("btn-stop").disabled = false' not in html

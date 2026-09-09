@@ -2182,9 +2182,9 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="stop_min_success_rate" min="0" max="100" step="0.1" value="65" title="对照面板近1小时成功率：低于该值且近1小时完成次数超过最少账号时停止任务"/>
       </div>
       <div class="control-actions">
-        <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
-        <button class="danger" id="btn-stop" onclick="doStop()">停止任务</button>
-        <button id="btn-save" onclick="saveCtrl()">保存设置</button>
+        <button class="primary" id="btn-start" onclick="doStart()" disabled>启动任务</button>
+        <button class="danger" id="btn-stop" onclick="doStop()" disabled>停止任务</button>
+        <button id="btn-save" onclick="saveCtrl()" disabled>保存设置</button>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
@@ -2718,6 +2718,7 @@ let lastSsoState = null;
 let controlBusy = "";
 let optimisticRunning = null;
 let pendingControl = null;
+let controlHydrated = false;
 function processIsRunning(d) {
   if (optimisticRunning === true) return true;
   if (optimisticRunning === false) return false;
@@ -2734,9 +2735,10 @@ function syncControlButtons(running) {
   const stop = document.getElementById("btn-stop");
   const save = document.getElementById("btn-save");
   const busy = !!controlBusy;
-  if (start) start.disabled = busy || !!running;
-  if (stop) stop.disabled = busy || !running;
-  if (save) save.disabled = busy;
+  const ready = controlHydrated && !busy;
+  if (start) start.disabled = !ready || !!running;
+  if (stop) stop.disabled = !ready || !running;
+  if (save) save.disabled = !ready;
 }
 function syncThemeButtons() {
   const theme = document.documentElement.dataset.theme || "light";
@@ -3467,7 +3469,10 @@ function fillControl(d) {
     if (matched) pendingControl = null;
   }
   const c = Object.assign({}, server, pendingControl || {});
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) return;
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) {
+    if (server.mode || server.workers != null) controlHydrated = true;
+    return;
+  }
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
@@ -3485,6 +3490,7 @@ function fillControl(d) {
   if (c.registration_scheme && document.getElementById("registration_scheme")) {
     document.getElementById("registration_scheme").value = c.registration_scheme;
   }
+  if (server.mode || server.workers != null) controlHydrated = true;
 }
 function controlBody() {
   return {
@@ -3500,6 +3506,10 @@ function controlBody() {
   };
 }
 async function saveCtrl() {
+  if (!controlHydrated) {
+    setMsg("ctrl-msg", "状态尚未加载，请稍后再保存", "err");
+    return;
+  }
   controlBusy = "save";
   syncControlButtons(processIsRunning(last));
   try {
@@ -3524,6 +3534,10 @@ async function saveCtrl() {
   syncControlButtons(processIsRunning(last));
 }
 async function doStart() {
+  if (!controlHydrated) {
+    setMsg("ctrl-msg", "状态尚未加载，请稍后再启动", "err");
+    return;
+  }
   controlBusy = "start";
   optimisticRunning = null;
   syncControlButtons(true);
