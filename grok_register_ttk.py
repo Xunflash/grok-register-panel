@@ -55,7 +55,7 @@ from retry_policy import (
     should_count_as_failure,
     slot_retries,
 )
-from success_stop import load_success_stop_settings, should_stop_low_success
+from success_stop import load_success_stop_settings, should_stop_from_hour_window
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -485,9 +485,15 @@ def record_register_result(
     return rec
 
 
-def apply_success_stop_if_needed(ok, fail, log_callback=None, stop_fn=None) -> bool:
-    """Stop the current run when completed attempts exceed the UI success floor."""
-    stop, reason = should_stop_low_success(ok, fail, load_success_stop_settings())
+def apply_success_stop_if_needed(ok=None, fail=None, log_callback=None, stop_fn=None, jsonl_path=None) -> bool:
+    """Stop the current run when the panel 近1小时 jsonl success rate is below the UI floor.
+
+    ok/fail are ignored; the 1h window already shown on the panel is the source of truth.
+    """
+    stop, reason = should_stop_from_hour_window(
+        jsonl_path or _RESULT_LOG_PATH,
+        load_success_stop_settings(),
+    )
     if not stop:
         return False
     if log_callback:

@@ -564,8 +564,13 @@ def blacklist_update_errors():
 @cached(30)
 def success_stats():
     """Aggregate success stats: CPA + jsonl + time-window rates + latest batch."""
-    from datetime import datetime, timezone, timedelta
-    from runtime_platform import TZ_BEIJING
+    from datetime import timedelta
+    from success_stop import (
+        JSONL_TAIL_BYTES,
+        parse_result_datetime,
+        result_status_bucket,
+        window_rate_percent,
+    )
 
     cpa = cpa_count()
     configured_base = read_base()
@@ -591,68 +596,47 @@ def success_stats():
         for h in windows_h
     }
 
-    def _parse_ts(ts: str):
-        if not ts:
-            return None
-        s = str(ts).strip()
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(TZ_BEIJING)
-        except Exception:
-            return None
-
     try:
         if results.exists():
             size = results.stat().st_size
             # last 8MB covers 12h under high volume
             with results.open("rb") as f:
-                if size > 8_000_000:
-                    f.seek(size - 8_000_000)
+                if size > JSONL_TAIL_BYTES:
+                    f.seek(size - JSONL_TAIL_BYTES)
                     f.readline()
                 for line in f:
                     try:
                         o = json.loads(line.decode("utf-8", errors="replace"))
                     except Exception:
                         continue
+                    if not isinstance(o, dict):
+                        continue
                     st = o.get("status")
-                    dt = _parse_ts(o.get("ts") or "")
+                    dt = parse_result_datetime(o.get("ts") or "")
+                    bucket = result_status_bucket(st)
                     # 按日统计用北京日期
                     day = dt.strftime("%Y-%m-%d") if dt else (o.get("ts") or "")[:10]
                     if day:
                         by_day.setdefault(day, {"ok": 0, "risk": 0, "fail": 0})
-                    if st == "ok":
+                    if bucket == "ok":
                         jsonl_ok += 1
                         if day:
                             by_day[day]["ok"] += 1
-                    elif st == "risk":
+                    elif bucket == "risk":
                         jsonl_risk += 1
                         if day:
                             by_day[day]["risk"] += 1
-                    elif st:
+                    elif bucket == "fail":
                         jsonl_fail += 1
                         if day:
                             by_day[day]["fail"] += 1
 
-                    if not dt:
+                    if not dt or not bucket:
                         continue
                     age = now - dt
                     for h in windows_h:
                         if age <= timedelta(hours=h):
-                            bucket = win[h]
-                            if st == "ok":
-                                bucket["ok"] += 1
-                            elif st == "risk":
-                                bucket["risk"] += 1
-                            elif st:
-                                bucket["fail"] += 1
-                            if st in ("ok", "risk", "fail", "sso_timeout", "browser", "other"):
-                                bucket["total"] += 1
-                            elif st:
-                                bucket["total"] += 1
+                            win[h][bucket] += 1
     except Exception:
         pass
 
@@ -662,14 +646,13 @@ def success_stats():
         # total attempts that finished with a status
         total = int(b["ok"]) + int(b["fail"]) + int(b["risk"])
         ok = int(b["ok"])
-        rate = round(100.0 * ok / total, 1) if total else None
         rates[f"{h}h"] = {
             "hours": h,
             "ok": ok,
             "fail": int(b["fail"]),
             "risk": int(b["risk"]),
             "total": total,
-            "success_rate": rate,
+            "success_rate": window_rate_percent(ok, int(b["fail"]), int(b["risk"])),
             "since": b["since"],
         }
 
@@ -728,6 +711,13 @@ def kill_all():
     killed = _terminate_managed_processes(
         ("run_until_100.py", "run_batch_headless.py")
     )
+    for pid_file in (ORCH_PID, BATCH_PID):
+        try:
+            pid_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     return {"ok": True, "killed": killed}
 
 
@@ -1019,6 +1009,15 @@ def snapshot():
 
 STATUS_WORKER = SnapshotWorker(snapshot)
 MAINTENANCE = MaintenanceGate()
+
+
+def _refresh_status_snapshot() -> None:
+    try:
+        STATUS_WORKER.refresh()
+    except Exception:
+        pass
+
+
 PROXY_SNAPSHOT = cached(3)(read_proxy_pool)
 STATS_SNAPSHOT = cached(30)(success_stats)
 BLACKLIST_ERROR_SNAPSHOT = cached(30)(blacklist_update_errors)
@@ -2177,15 +2176,15 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>
       </div>
       <div class="field"><label for="stop_min_accounts">停机最少账号</label>
-        <input type="number" id="stop_min_accounts" min="1" max="5000" value="10" title="完成次数（成功+失败）超过该值后才检查成功率"/>
+        <input type="number" id="stop_min_accounts" min="1" max="5000" value="10" title="近1小时完成次数（成功+失败+风控）超过该值后才检查近1小时成功率"/>
       </div>
       <div class="field"><label for="stop_min_success_rate">停机最低成功率%</label>
-        <input type="number" id="stop_min_success_rate" min="0" max="100" step="0.1" value="65" title="完成次数超过最少账号且成功率低于该值时停止任务"/>
+        <input type="number" id="stop_min_success_rate" min="0" max="100" step="0.1" value="65" title="对照面板近1小时成功率：低于该值且近1小时完成次数超过最少账号时停止任务"/>
       </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
         <button class="danger" id="btn-stop" onclick="doStop()">停止任务</button>
-        <button onclick="saveCtrl()">保存设置</button>
+        <button id="btn-save" onclick="saveCtrl()">保存设置</button>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
@@ -2716,6 +2715,29 @@ let lastFullStats = null;
 let ssoSource = "paste";
 let ssoFilter = "all";
 let lastSsoState = null;
+let controlBusy = "";
+let optimisticRunning = null;
+let pendingControl = null;
+function processIsRunning(d) {
+  if (optimisticRunning === true) return true;
+  if (optimisticRunning === false) return false;
+  const p = (d && d.process) || {};
+  return !!(p.running || p.orch_running || p.batch_running);
+}
+function bustStatusCache() {
+  Array.from(responseCache.keys()).forEach(function (key) {
+    if (String(key).indexOf("/api/status") === 0) responseCache.delete(key);
+  });
+}
+function syncControlButtons(running) {
+  const start = document.getElementById("btn-start");
+  const stop = document.getElementById("btn-stop");
+  const save = document.getElementById("btn-save");
+  const busy = !!controlBusy;
+  if (start) start.disabled = busy || !!running;
+  if (stop) stop.disabled = busy || !running;
+  if (save) save.disabled = busy;
+}
 function syncThemeButtons() {
   const theme = document.documentElement.dataset.theme || "light";
   document.querySelectorAll("[data-theme-choice]").forEach(button => {
@@ -3420,7 +3442,7 @@ async function refresh() {
     if (d.schema_version === 2) d.ts_human = new Date((d.sampled_at || Date.now() / 1000) * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
     last = d;
     render(d);
-    refreshDelay = d.process && d.process.running ? 2000 : 10000;
+    refreshDelay = processIsRunning(d) ? 2000 : 10000;
   } catch (e) {
     const message = String(e.message || e);
     document.getElementById("clock").textContent = message.includes("令牌") ? "需要令牌" : "连接异常";
@@ -3436,7 +3458,15 @@ async function refresh() {
   }
 }
 function fillControl(d) {
-  const c = d.control || {};
+  const server = d.control || {};
+  if (pendingControl) {
+    const keys = Object.keys(pendingControl);
+    const matched = keys.length && keys.every(function (key) {
+      return String(server[key] ?? "") === String(pendingControl[key] ?? "");
+    });
+    if (matched) pendingControl = null;
+  }
+  const c = Object.assign({}, server, pendingControl || {});
   if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) return;
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
@@ -3470,33 +3500,64 @@ function controlBody() {
   };
 }
 async function saveCtrl() {
+  controlBusy = "save";
+  syncControlButtons(processIsRunning(last));
   try {
-    const j = await api("/api/control", { method: "POST", body: JSON.stringify(controlBody()) });
+    const body = controlBody();
+    const j = await api("/api/control", { method: "POST", body: JSON.stringify(body) });
+    pendingControl = {
+      workers: j.workers,
+      batch_count: j.batch_count,
+      add_count: j.add_count,
+      risk_pause: j.risk_pause,
+      stop_min_accounts: j.stop_min_accounts,
+      stop_min_success_rate: j.stop_min_success_rate,
+      mode: j.mode,
+      turnstile_provider: j.turnstile_provider,
+      registration_scheme: j.registration_scheme,
+    };
     setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，方案 " + (j.registration_scheme || ""), "ok");
+    bustStatusCache();
+    setTimeout(refresh, 400);
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
+  controlBusy = "";
+  syncControlButtons(processIsRunning(last));
 }
 async function doStart() {
-  document.getElementById("btn-start").disabled = true;
+  controlBusy = "start";
+  optimisticRunning = null;
+  syncControlButtons(true);
   setMsg("ctrl-msg", "正在启动…", "");
   try {
     await api("/api/control", { method: "POST", body: JSON.stringify(controlBody()) });
     const j = await api("/api/start", { method: "POST", body: JSON.stringify(controlBody()) });
     if (j.ok === false) throw new Error(j.error || "start failed");
+    optimisticRunning = true;
     const msg = j.message || ("已启动，进程 " + (j.pid || "?") + "，模式 " + (j.mode || ""));
     setMsg("ctrl-msg", msg + (j.need != null ? "，剩余 " + j.need : ""), "ok");
-    setTimeout(refresh, 1000);
-    setTimeout(refresh, 3000);
-  } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
-  document.getElementById("btn-start").disabled = false;
+    bustStatusCache();
+    setTimeout(refresh, 400);
+    setTimeout(refresh, 2000);
+  } catch (e) {
+    const text = String(e.message || e);
+    optimisticRunning = text.indexOf("already running") >= 0;
+    setMsg("ctrl-msg", text, "err");
+  }
+  controlBusy = "";
+  syncControlButtons(processIsRunning(last));
 }
 async function doStop() {
-  document.getElementById("btn-stop").disabled = true;
+  controlBusy = "stop";
+  syncControlButtons(true);
   try {
     const j = await api("/api/stop", { method: "POST", body: "{}" });
+    optimisticRunning = false;
     setMsg("ctrl-msg", "已停止 killed=" + JSON.stringify(j.killed || []), "ok");
-    setTimeout(refresh, 800);
+    bustStatusCache();
+    setTimeout(refresh, 400);
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
-  document.getElementById("btn-stop").disabled = false;
+  controlBusy = "";
+  syncControlButtons(processIsRunning(last));
 }
 async function resetBlacklist(mode) {
   mode = mode || "baseline";
@@ -3847,11 +3908,15 @@ function render(d) {
   document.getElementById("clock").textContent = d.ts_human || "--";
   document.getElementById("logname").textContent =
     (d.log_name || d.log || "--") + (d.process && d.process.etime ? " / 用时 " + d.process.etime : "");
-  const on = !!(d.process && d.process.running);
+  const serverOn = !!(d.process && (d.process.running || d.process.orch_running || d.process.batch_running));
+  if (optimisticRunning === true && serverOn) optimisticRunning = null;
+  if (optimisticRunning === false && !serverOn) optimisticRunning = null;
+  const on = processIsRunning(d);
   document.getElementById("run-dot").className = "dot " + (on ? "on" : (d.ended ? "done" : "off"));
   let runLabel = "已停止";
   if (d.process && d.process.orch_running) runLabel = "编排运行 #" + d.process.orch_pid;
   else if (d.process && d.process.batch_running) runLabel = "单批运行 #" + d.process.batch_pid;
+  else if (on) runLabel = "运行中";
   else if (d.ended) runLabel = "已完成";
   document.getElementById("run-label").textContent = runLabel;
   document.getElementById("run-status").setAttribute("aria-label", "任务状态：" + runLabel);
@@ -3861,8 +3926,7 @@ function render(d) {
     sync.className = "badge";
   }
   document.getElementById("ctrl-status").textContent = on ? "运行中" : "空闲";
-  document.getElementById("btn-start").disabled = on;
-  document.getElementById("btn-stop").disabled = !on;
+  if (!controlBusy) syncControlButtons(on);
   fillControl(d);
 
   const traffic = d.traffic || {};
@@ -4349,7 +4413,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/control":
             try:
-                self._json(200, save_control(body))
+                saved = save_control(body)
+                _refresh_status_snapshot()
+                self._json(200, saved)
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
@@ -4359,15 +4425,19 @@ class Handler(BaseHTTPRequestHandler):
                     save_control(body)
                 mode = (body or {}).get("mode") or load_control().get("mode") or "orch"
                 if mode == "batch":
-                    self._json(200, start_batch_only())
+                    result = start_batch_only()
                 else:
-                    self._json(200, start_orch())
+                    result = start_orch()
+                _refresh_status_snapshot()
+                self._json(200, result)
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
         if u.path == "/api/stop":
             try:
-                self._json(200, kill_all())
+                result = kill_all()
+                _refresh_status_snapshot()
+                self._json(200, result)
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return

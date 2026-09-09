@@ -383,6 +383,74 @@ def load_inventory(inventory_path: str) -> List[Dict[str, str]]:
     return accounts
 
 
+def parse_inventory_line(raw: str) -> Optional[Dict[str, str]]:
+    line = str(raw or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("{"):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None
+        if isinstance(obj, dict):
+            return _parse_jsonl_row(obj)
+        return None
+    return _parse_text_line(line)
+
+
+def append_inventory_lines(inventory_path: str, lines) -> Dict[str, int]:
+    """Append unique valid Outlook RT accounts. Does not mark them used."""
+    path = Path(normalize_inventory_path(inventory_path)).expanduser()
+    incoming: list[tuple[str, str]] = []
+    seen_in: set[str] = set()
+    skipped_invalid = 0
+    skipped_incoming_dup = 0
+    for raw in lines:
+        acc = parse_inventory_line(raw)
+        if not acc:
+            if str(raw or "").strip() and not str(raw).strip().startswith("#"):
+                skipped_invalid += 1
+            continue
+        key = acc["email"].lower()
+        if key in seen_in:
+            skipped_incoming_dup += 1
+            continue
+        seen_in.add(key)
+        incoming.append((key, str(raw).strip()))
+
+    with _lock:
+        with exclusive_file_lock(inventory_lock_path(str(path))):
+            existing: set[str] = set()
+            if path.is_file():
+                for raw in path.read_text(encoding="utf-8-sig").splitlines():
+                    acc = parse_inventory_line(raw)
+                    if acc:
+                        existing.add(acc["email"].lower())
+            added_lines: list[str] = []
+            skipped_dup = 0
+            for key, line in incoming:
+                if key in existing:
+                    skipped_dup += 1
+                    continue
+                existing.add(key)
+                added_lines.append(line)
+            if added_lines:
+                prefix = ""
+                if path.is_file() and path.stat().st_size > 0:
+                    with path.open("rb") as handle:
+                        handle.seek(-1, os.SEEK_END)
+                        if handle.read(1) != b"\n":
+                            prefix = "\n"
+                append_private_text(path, prefix + "\n".join(added_lines) + "\n")
+            total = len(existing)
+    return {
+        "added": len(added_lines),
+        "skipped_dup": skipped_dup + skipped_incoming_dup,
+        "skipped_invalid": skipped_invalid,
+        "total": total,
+    }
+
+
 def _load_used(used_file: Path) -> set[str]:
     if not used_file.is_file():
         return set()

@@ -28,7 +28,7 @@ def test_redact_proxy_shipped():
     sys.path.insert(0, str(ROOT))
     from webui.security_utils import redact_proxy
     secret = 'super-secret-pass-ZZ'
-    out = redact_proxy(f'http://u:{secret}@10.0.0.1:8080')
+    out = redact_proxy(f'http://u:{secret}@proxy.example.test:8080')
     assert secret not in out
 
 def test_theme_switch_structure():
@@ -138,6 +138,27 @@ def test_proxy_pool_panel_structure():
     assert 'pool = load_proxy_pool()' in worker
     assert '面板代理池没有健康且启用的代理' in worker
     assert 'redact_proxy(px)' in worker
+
+def test_control_buttons_optimistic_and_save_id():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="btn-start"' in html
+    assert 'id="btn-stop"' in html
+    assert 'id="btn-save"' in html
+    assert 'function processIsRunning(d)' in html
+    assert 'function bustStatusCache()' in html
+    assert 'function syncControlButtons(running)' in html
+    assert 'let controlBusy = "";' in html
+    assert 'let optimisticRunning = null;' in html
+    assert 'let pendingControl = null;' in html
+    assert 'p.running || p.orch_running || p.batch_running' in html
+    assert 'document.getElementById("btn-start").disabled = false' not in html
+    assert 'document.getElementById("btn-stop").disabled = false' not in html
+    assert '对照面板近1小时成功率' in html
+    assert 'STATUS_WORKER.refresh()' in mon
+    assert 'should_stop_from_hour_window' in (ROOT / 'run_until_100.py').read_text(encoding='utf-8')
+    assert 'should_stop_from_hour_window' in (ROOT / 'grok_register_ttk.py').read_text(encoding='utf-8')
+
 
 def test_embedded_scripts_parse():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
@@ -278,4 +299,6 @@ if __name__ == '__main__':
     test_proxy_pool_panel_structure()
     test_email_service_and_domain_rotation_panel_structure()
     test_panel_security_and_recovery_structure()
+    test_control_buttons_optimistic_and_save_id()
+    test_embedded_scripts_parse()
     print('OK structure')

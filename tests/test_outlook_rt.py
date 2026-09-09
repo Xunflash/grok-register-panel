@@ -98,6 +98,41 @@ def test_take_mark_used_and_stats():
         assert "one@outlook.com" in used_file.read_text(encoding="utf-8")
 
 
+def test_append_inventory_lines_skips_duplicates_and_keeps_used():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.txt"
+        inv.write_text(
+            "keep@outlook.com----pass----cid----RT_KEEP\n",
+            encoding="utf-8",
+        )
+        outlook_rt.mark_used("keep@outlook.com", str(inv), reason="already-spent")
+        used_before = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+        result = outlook_rt.append_inventory_lines(
+            str(inv),
+            [
+                "keep@outlook.com----pass----cid----RT_KEEP",
+                "new@outlook.com----pw----cid----RT_NEW",
+                "new@outlook.com----pw----cid----RT_NEW",
+                "not-an-account",
+                "# comment",
+                "third@outlook.com----pw----cid----RT_THIRD",
+            ],
+        )
+        assert result["added"] == 2
+        assert result["skipped_dup"] == 2
+        assert result["skipped_invalid"] == 1
+        assert result["total"] == 3
+        text = inv.read_text(encoding="utf-8")
+        assert "new@outlook.com----pw----cid----RT_NEW" in text
+        assert "third@outlook.com----pw----cid----RT_THIRD" in text
+        emails = [row["email"].lower() for row in outlook_rt.load_inventory(str(inv))]
+        assert emails == ["keep@outlook.com", "new@outlook.com", "third@outlook.com"]
+        assert outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8") == used_before
+        stats = outlook_rt.inventory_stats(str(inv))
+        assert stats["total"] == 3
+        assert stats["available"] == 2
+
+
 def test_cross_process_claims_are_unique():
     with tempfile.TemporaryDirectory() as tmp:
         inv = Path(tmp) / "stock.jsonl"
@@ -899,6 +934,7 @@ def test_wait_for_code_fast_fail_on_repeated_graph_401():
 if __name__ == "__main__":
     test_load_jsonl_and_text_formats()
     test_take_mark_used_and_stats()
+    test_append_inventory_lines_skips_duplicates_and_keeps_used()
     test_cross_process_claims_are_unique()
     test_find_code_in_messages()
     test_graph_timestamp_is_utc_independent_of_host_timezone()

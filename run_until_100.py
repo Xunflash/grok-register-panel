@@ -18,7 +18,7 @@ from runtime_platform import (
     runtime_python,
 )
 from retry_policy import PRECHECK_EXIT_CODE, orchestrator_failure_limit
-from success_stop import load_success_stop_settings, should_stop_low_success
+from success_stop import load_success_stop_settings, should_stop_from_hour_window, window_success_counts
 from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
@@ -345,13 +345,19 @@ def main():
             oks = count_ok(logpath)
             fails = count_fail(logpath)
             delta = cpa_count() - BASE0
-            log(f"  mon ok={oks} fail={fails} risk={risks} cpa_delta={delta}/100 alive={alive}")
+            hour = window_success_counts(RESULTS, hours=1)
+            hour_rate = hour.get("success_rate")
+            hour_rate_txt = f"{hour_rate:.1f}%" if hour_rate is not None else "--"
+            log(
+                f"  mon ok={oks} fail={fails} risk={risks} cpa_delta={delta}/100 alive={alive} "
+                f"1h={hour.get('ok')}/{hour.get('total')} {hour_rate_txt}"
+            )
             if cpa_count() >= TARGET_CPA:
                 log("TARGET reached")
                 kill_batch()
                 break
-            stop_low, stop_reason = should_stop_low_success(
-                oks, fails, load_success_stop_settings(CONTROL_FILE)
+            stop_low, stop_reason = should_stop_from_hour_window(
+                RESULTS, load_success_stop_settings(CONTROL_FILE)
             )
             if stop_low:
                 log(f"  HIT {stop_reason}")
