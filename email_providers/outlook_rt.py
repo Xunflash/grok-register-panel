@@ -535,12 +535,13 @@ def _update_refresh_in_inventory(
     new_refresh: str,
     *,
     client_id: str = "",
-) -> None:
-    if not new_refresh:
-        return
+    password: str = "",
+) -> bool:
+    if not new_refresh and not password and not client_id:
+        return False
     path = Path(normalize_inventory_path(inventory_path)).expanduser()
     if not path.is_file():
-        return
+        return False
     # 线程锁 + 文件锁，避免多 worker 并发写串行/覆盖
     with _lock:
         with exclusive_file_lock(inventory_lock_path(inventory_path)):
@@ -562,14 +563,17 @@ def _update_refresh_in_inventory(
                     if isinstance(obj, dict):
                         em = str(obj.get("email") or obj.get("mail") or "").strip().lower()
                         if em == email_l:
-                            if "refresh_token" in obj:
-                                obj["refresh_token"] = new_refresh
-                            elif "refreshToken" in obj:
-                                obj["refreshToken"] = new_refresh
-                            else:
-                                obj["refresh_token"] = new_refresh
+                            if new_refresh:
+                                if "refresh_token" in obj:
+                                    obj["refresh_token"] = new_refresh
+                                elif "refreshToken" in obj:
+                                    obj["refreshToken"] = new_refresh
+                                else:
+                                    obj["refresh_token"] = new_refresh
                             if client_id:
                                 obj["client_id"] = client_id
+                            if password:
+                                obj["password"] = password
                             rewritten = json.dumps(obj, ensure_ascii=False) + "\n"
                 else:
                     acc = _parse_text_line(stripped)
@@ -578,18 +582,22 @@ def _update_refresh_in_inventory(
                             parts = stripped.split("----")
                             if len(parts) >= 4:
                                 cid = client_id or parts[2].strip()
+                                pw = password or parts[1].strip()
+                                rt = new_refresh or "----".join(parts[3:]).strip()
                                 rewritten = (
-                                    f"{parts[0].strip()}----{parts[1].strip()}----"
-                                    f"{cid}----{new_refresh}\n"
+                                    f"{parts[0].strip()}----{pw}----{cid}----{rt}\n"
                                 )
                             elif len(parts) == 2:
-                                rewritten = f"{parts[0].strip()}----{new_refresh}\n"
+                                rewritten = (
+                                    f"{parts[0].strip()}----{new_refresh or parts[1].strip()}\n"
+                                )
                             elif len(parts) == 3:
                                 cid = client_id or parts[1].strip()
                                 rewritten = (
-                                    f"{parts[0].strip()}----{cid}----{new_refresh}\n"
+                                    f"{parts[0].strip()}----{cid}----"
+                                    f"{new_refresh or parts[2].strip()}\n"
                                 )
-                        else:
+                        elif new_refresh:
                             rewritten = f"{acc['email']}----{new_refresh}\n"
                 if rewritten is not None:
                     out.append(rewritten)
@@ -598,6 +606,25 @@ def _update_refresh_in_inventory(
                     out.append(raw if raw.endswith("\n") else raw + "\n")
             if changed:
                 atomic_write_text(path, "".join(out), encoding="utf-8")
+            return changed
+
+
+def update_inventory_credentials(
+    inventory_path: str,
+    email_addr: str,
+    *,
+    refresh_token: str = "",
+    password: str = "",
+    client_id: str = "",
+) -> bool:
+    """Rewrite one inventory row in place. Does not mark used."""
+    return _update_refresh_in_inventory(
+        inventory_path,
+        email_addr,
+        refresh_token,
+        client_id=client_id,
+        password=password,
+    )
 
 
 def refresh_access_token(
