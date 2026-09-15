@@ -85,6 +85,40 @@ def test_save_control_persists_success_stop():
         assert disk["stop_min_success_rate"] == 70.0
 
 
+def test_save_control_persists_debug_mode_har_flag():
+    from webui import monitor
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        control_file = root / "monitor_control.json"
+        config_file = root / "config.json"
+        log_dir = root / "log"
+        log_dir.mkdir()
+        config_file.write_text(json.dumps({"debug_mode": False, "turnstile_provider": "capsolver"}), encoding="utf-8")
+        previous = monitor.CONTROL_FILE, monitor.ROOT, monitor.LOG_DIR
+        monitor.CONTROL_FILE = control_file
+        monitor.ROOT = root
+        monitor.LOG_DIR = log_dir
+        try:
+            saved = monitor.save_control({"debug_mode": True, "workers": 2})
+            env_on = monitor._registration_env()
+            cfg_on = json.loads(config_file.read_text(encoding="utf-8"))
+            saved_off = monitor.save_control({"debug_mode": False})
+            env_off = monitor._registration_env()
+            cfg_off = json.loads(config_file.read_text(encoding="utf-8"))
+        finally:
+            monitor.CONTROL_FILE, monitor.ROOT, monitor.LOG_DIR = previous
+        assert saved["debug_mode"] is True
+        assert cfg_on["debug_mode"] is True
+        assert saved_off["debug_mode"] is False
+        assert cfg_off["debug_mode"] is False
+        assert env_on.get("GROK_DEBUG_MODE") == "1"
+        assert env_on.get("GROK_RECORD_HAR_DIR") == str(log_dir / "browser-hars")
+        assert (log_dir / "browser-hars").is_dir()
+        assert env_off.get("GROK_DEBUG_MODE") in (None, "")
+        assert "GROK_RECORD_HAR_DIR" not in env_off
+
+
 def test_hour_window_matches_panel_success_stats():
     from webui import monitor
 
@@ -163,6 +197,7 @@ def test_v2_summary_keeps_success_stop_control():
                 "workers": 3,
                 "stop_min_accounts": 10,
                 "stop_min_success_rate": 65.0,
+                "debug_mode": True,
             },
             "process": {"running": False, "orch_running": False, "batch_running": False},
             "rates": {"1h": {"ok": 8, "fail": 4, "risk": 2, "total": 14, "success_rate": 57.1}},
@@ -170,6 +205,7 @@ def test_v2_summary_keeps_success_stop_control():
     )
     assert projected["control"]["stop_min_accounts"] == 10
     assert projected["control"]["stop_min_success_rate"] == 65.0
+    assert projected["control"]["debug_mode"] is True
     assert projected["rates"]["1h"]["success_rate"] == 57.1
 
 
@@ -179,6 +215,7 @@ if __name__ == "__main__":
     test_zero_rate_floor_never_stops()
     test_normalize_clamps_and_defaults()
     test_save_control_persists_success_stop()
+    test_save_control_persists_debug_mode_har_flag()
     test_hour_window_matches_panel_success_stats()
     test_hour_window_ignores_current_batch_only_dip()
     test_v2_summary_keeps_success_stop_control()

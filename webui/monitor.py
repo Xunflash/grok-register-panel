@@ -225,6 +225,27 @@ def _write_json(path: Path, data: dict):
     atomic_write_json(path, data)
 
 
+def _coerce_debug_mode(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "开", "开启"}
+    return bool(value)
+
+
+def persist_debug_mode(enabled: bool, config_path) -> bool:
+    path = Path(config_path)
+    data = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict):
+            data = loaded
+    data["debug_mode"] = bool(enabled)
+    atomic_write_json(path, data)
+    return bool(enabled)
+
+
 def load_control() -> dict:
     with CONTROL_LOCK:
         c = _read_json(CONTROL_FILE, {})
@@ -237,6 +258,14 @@ def load_control() -> dict:
         c.setdefault("registration_scheme", "browser")
         c.setdefault("stop_min_accounts", 10)
         c.setdefault("stop_min_success_rate", 65)
+        debug_mode = _coerce_debug_mode(c.get("debug_mode"))
+        try:
+            cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8") or "{}")
+            if isinstance(cfg, dict) and "debug_mode" in cfg:
+                debug_mode = _coerce_debug_mode(cfg.get("debug_mode"))
+        except Exception:
+            pass
+        c["debug_mode"] = debug_mode
         return c
 
 
@@ -253,6 +282,7 @@ def save_control(updates: dict) -> dict:
         "registration_scheme",
         "stop_min_accounts",
         "stop_min_success_rate",
+        "debug_mode",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -305,6 +335,11 @@ def save_control(updates: dict) -> dict:
         c["registration_scheme"] = scheme
         try:
             persist_registration_scheme(scheme, ROOT / "config.json")
+        except Exception:
+            pass
+        c["debug_mode"] = _coerce_debug_mode(c.get("debug_mode"))
+        try:
+            persist_debug_mode(c["debug_mode"], ROOT / "config.json")
         except Exception:
             pass
         for key in ("base_cpa", "target_cpa"):
@@ -785,12 +820,7 @@ def _registration_env() -> dict[str, str]:
         env[ENV_NAME] = scheme
         if scheme == SCHEME_PROTOCOL:
             env["GROK_FP_ENHANCE"] = "0"
-        debug_mode = False
-        try:
-            cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8") or "{}")
-            debug_mode = bool(cfg.get("debug_mode")) if isinstance(cfg, dict) else False
-        except Exception:
-            debug_mode = False
+        debug_mode = _coerce_debug_mode(control.get("debug_mode"))
         if debug_mode:
             env["GROK_DEBUG_MODE"] = "1"
             har_dir = str(LOG_DIR / "browser-hars")
@@ -2188,6 +2218,13 @@ HTML = r"""<!DOCTYPE html>
       <div class="field"><label for="stop_min_success_rate">停机最低成功率%</label>
         <input type="number" id="stop_min_success_rate" min="0" max="100" step="0.1" value="65" title="对照面板近1小时成功率：低于该值且近1小时完成次数超过最少账号时停止任务"/>
       </div>
+      <div class="field">
+        <label for="debug_mode">调试模式</label>
+        <select id="debug_mode" title="开启后把浏览器 HAR 保存到 log/browser-hars；关闭则不录 HAR。与桌面端「调试模式」同一开关。">
+          <option value="off">关闭（不保存 HAR）</option>
+          <option value="on">开启（保存 HAR）</option>
+        </select>
+      </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()" disabled>启动任务</button>
         <button class="danger" id="btn-stop" onclick="doStop()" disabled>停止任务</button>
@@ -3476,7 +3513,7 @@ function fillControl(d) {
     if (matched) pendingControl = null;
   }
   const c = Object.assign({}, server, pendingControl || {});
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme"].includes(document.activeElement.id)) {
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme","debug_mode"].includes(document.activeElement.id)) {
     if (server.mode || server.workers != null) controlHydrated = true;
     return;
   }
@@ -3497,6 +3534,9 @@ function fillControl(d) {
   if (c.registration_scheme && document.getElementById("registration_scheme")) {
     document.getElementById("registration_scheme").value = c.registration_scheme;
   }
+  if (document.getElementById("debug_mode") && c.debug_mode != null) {
+    document.getElementById("debug_mode").value = c.debug_mode ? "on" : "off";
+  }
   if (server.mode || server.workers != null) controlHydrated = true;
 }
 function controlBody() {
@@ -3510,6 +3550,7 @@ function controlBody() {
     mode: document.getElementById("mode").value || "orch",
     turnstile_provider: (document.getElementById("turnstile_provider") || {}).value || "capsolver",
     registration_scheme: (document.getElementById("registration_scheme") || {}).value || "browser",
+    debug_mode: ((document.getElementById("debug_mode") || {}).value || "off") === "on",
   };
 }
 async function saveCtrl() {
@@ -3532,8 +3573,9 @@ async function saveCtrl() {
       mode: j.mode,
       turnstile_provider: j.turnstile_provider,
       registration_scheme: j.registration_scheme,
+      debug_mode: !!j.debug_mode,
     };
-    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，方案 " + (j.registration_scheme || ""), "ok");
+    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，方案 " + (j.registration_scheme || "") + "，HAR " + (j.debug_mode ? "开" : "关"), "ok");
     bustStatusCache();
     setTimeout(refresh, 400);
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }

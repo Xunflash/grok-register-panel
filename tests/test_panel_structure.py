@@ -165,6 +165,9 @@ def test_control_buttons_optimistic_and_save_id():
     assert 'document.getElementById("btn-start").disabled = false' not in html
     assert 'document.getElementById("btn-stop").disabled = false' not in html
     assert '对照面板近1小时成功率' in html
+    assert 'id="debug_mode"' in html
+    assert '开启（保存 HAR）' in html
+    assert '关闭（不保存 HAR）' in html
     assert 'grid-column: 1 / -1;' in html
     assert 'STATUS_WORKER.refresh()' in mon
     assert 'should_stop_from_hour_window' in (ROOT / 'run_until_100.py').read_text(encoding='utf-8')
