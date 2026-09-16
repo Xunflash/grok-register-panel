@@ -1,0 +1,356 @@
+{
+  "log": {
+    "version": "1.2",
+    "creator": {
+      "name": "redacted-excerpt",
+      "version": "1"
+    },
+    "entries": [
+      {
+        "request": {
+          "method": "GET",
+          "url": "https://accounts.x.ai/sign-up?redirect=grok-com",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            }
+          ]
+        },
+        "response": {
+          "status": 200,
+          "headers": [
+            {
+              "name": "set-cookie",
+              "value": "gb_anon_id=dbfd0ec0-32e2-4ec2-a3f2-e96995c35f71; Path=/; HttpOnly; Secure"
+            },
+            {
+              "name": "set-cookie",
+              "value": "redirect=%7B%22redirectDestination%22%3A%22grok-com%22%7D; Path=/; HttpOnly; Secure"
+            },
+            {
+              "name": "set-cookie",
+              "value": "referrer=grok-com; Path=/; HttpOnly; Secure"
+            },
+            {
+              "name": "set-cookie",
+              "value": "referrer_action=; Path=/; HttpOnly; Secure"
+            },
+            {
+              "name": "set-cookie",
+              "value": "mp_0b4055a12491884bcb6f34a5aa2718b6_mixpanel=%7B%22distinct_id%22%3A%22%24device%3Ad9375fc4-c127-4b6a-ba3b-18ecca5162ef%22%7D; Path=/"
+            },
+            {
+              "name": "set-cookie",
+              "value": "__cf_bm=cf-bm-html-fixture; Domain=x.ai; Path=/; HttpOnly; Secure"
+            }
+          ],
+          "content": {
+            "text": "<html>\"castlePk\":\"pk_p8GGWvD3TmFJZRsX3BQcqAv9aFVispNz\" sitekey=0x4AAAAAAAhr9JGVDZbrZOo0</html>"
+          }
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/cdn-cgi/rum?",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"eventType\": 1, \"location\": \"https://accounts.x.ai/sign-up\", \"nt\": \"navigate\", \"pageloadId\": \"pageload-fixture\", \"siteToken\": \"sitetoken-fixture\", \"startTime\": 1, \"versions\": {\"fl\": \"2024.11.0\", \"js\": \"2026.8.4\"}}"
+          }
+        },
+        "response": {
+          "status": 204
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/cdn-cgi/challenge-platform/h/b/jsd/oneshot/fixture-challenge/a",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "text/plain;charset=UTF-8"
+            }
+          ],
+          "postData": {
+            "mimeType": "text/plain;charset=UTF-8",
+            "text": "jsd-body-fixture"
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": [
+            {
+              "name": "set-cookie",
+              "value": "cf_clearance=cf-clearance-jsd-fixture; Domain=x.ai; Path=/; HttpOnly; Secure"
+            },
+            {
+              "name": "set-cookie",
+              "value": "__cf_bm=cf-bm-jsd-fixture; Domain=x.ai; Path=/; HttpOnly; Secure"
+            }
+          ]
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/mp/track/?verbose=1&ip=1",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/x-www-form-urlencoded",
+            "text": "data=%5B%7B%22event%22%3A%22account_signup_flow_started%22%2C%22properties%22%3A%7B%22page_route%22%3A%22sign-up%22%2C%22xai_app_name%22%3A%22account%22%7D%7D%5D"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/observability/client-metrics",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"events\": [{\"type\": \"navigation\", \"path\": \"/sign-up\"}]}"
+          }
+        },
+        "response": {
+          "status": 204
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/send-verification-code",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "*/*"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Sec-Fetch-Dest",
+              "value": "empty"
+            },
+            {
+              "name": "Sec-Fetch-Mode",
+              "value": "cors"
+            },
+            {
+              "name": "Sec-Fetch-Site",
+              "value": "same-origin"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "gb_anon_id",
+              "value": "dbfd0ec0-32e2-4ec2-a3f2-e96995c35f71"
+            },
+            {
+              "name": "redirect",
+              "value": "%7B%22redirectDestination%22%3A%22grok-com%22%7D"
+            },
+            {
+              "name": "referrer",
+              "value": "grok-com"
+            },
+            {
+              "name": "__cf_bm",
+              "value": "cf-bm-html-fixture"
+            },
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-jsd-fixture"
+            },
+            {
+              "name": "xai_anon_id",
+              "value": "d8a702cf-2f4d-4cb3-9070-5388b7dd11c4"
+            },
+            {
+              "name": "mp_0b4055a12491884bcb6f34a5aa2718b6_mixpanel",
+              "value": "%7B%22distinct_id%22%3A%22%24device%3Ad9375fc4-c127-4b6a-ba3b-18ecca5162ef%22%7D"
+            },
+            {
+              "name": "__cuid",
+              "value": "5d059fe4-0c1c-45aa-8fd7-7bb28befea50"
+            },
+            {
+              "name": "OptanonConsent",
+              "value": "isGpcEnabled=0&datestamp=Wed+Sep+02+2026+02:08:04+GMT-0400+(Eastern+Daylight+Time)&version=202603.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&landingPath=https://accounts.x.ai/sign-up&groups=C0001:1,C0004:1,C0002:1"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"GladysVanderlugt4955@outlook.com\", \"castleRequestToken\": \"castle-token-fixture\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/sign-up/verify-email",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "*/*"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.9"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Sec-Fetch-Dest",
+              "value": "empty"
+            },
+            {
+              "name": "Sec-Fetch-Mode",
+              "value": "cors"
+            },
+            {
+              "name": "Sec-Fetch-Site",
+              "value": "same-origin"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-fixture"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"GladysVanderlugt4955@outlook.com\", \"code\": \"300747\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      },
+      {
+        "request": {
+          "method": "POST",
+          "url": "https://accounts.x.ai/api/auth/sign-up/create-account",
+          "headers": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Origin",
+              "value": "https://accounts.x.ai"
+            },
+            {
+              "name": "Referer",
+              "value": "https://accounts.x.ai/sign-up?redirect=grok-com"
+            },
+            {
+              "name": "sentry-trace",
+              "value": "sentry-trace-fixture"
+            },
+            {
+              "name": "baggage",
+              "value": "sentry-environment=production"
+            }
+          ],
+          "cookies": [
+            {
+              "name": "cf_clearance",
+              "value": "cf-clearance-fixture"
+            },
+            {
+              "name": "__cf_bm",
+              "value": "cf-bm-fixture"
+            }
+          ],
+          "postData": {
+            "mimeType": "application/json",
+            "text": "{\"email\": \"fixture@example.com\", \"password\": \"FixturePass1!\", \"givenName\": \"Ada\", \"familyName\": \"Lovelace\", \"emailValidationCode\": \"123456\", \"turnstileToken\": \"turnstile-token-fixture\"}"
+          }
+        },
+        "response": {
+          "status": 200
+        }
+      }
+    ]
+  }
+}

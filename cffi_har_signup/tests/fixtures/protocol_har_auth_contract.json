@@ -1,0 +1,32 @@
+{
+  "paths": [
+    "/api/auth/send-verification-code",
+    "/api/auth/sign-up/verify-email",
+    "/api/auth/sign-up/create-account"
+  ],
+  "forbidden_paths": [
+    "/auth_mgmt.AuthManagement/CreateEmailValidationCode",
+    "/auth_mgmt.AuthManagement/CreateUserAndSessionV2"
+  ],
+  "calls": {
+    "/api/auth/send-verification-code": {
+      "method": "POST",
+      "json_keys": ["castleRequestToken", "email"]
+    },
+    "/api/auth/sign-up/verify-email": {
+      "method": "POST",
+      "json_keys": ["code", "email"]
+    },
+    "/api/auth/sign-up/create-account": {
+      "method": "POST",
+      "json_keys": [
+        "email",
+        "emailValidationCode",
+        "familyName",
+        "givenName",
+        "password",
+        "turnstileToken"
+      ]
+    }
+  }
+}

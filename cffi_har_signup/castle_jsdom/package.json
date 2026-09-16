@@ -1,0 +1,9 @@
+{
+  "name": "cffi-castle-jsdom",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@castleio/castle-js": "2.8.5",
+    "jsdom": "24.1.3"
+  }
+}

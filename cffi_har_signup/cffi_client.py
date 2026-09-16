@@ -1,0 +1,79 @@
+# -*- coding: utf-8 -*-
+"""curl_cffi session that replays 协议 HAR auth POSTs. No browser."""
+from __future__ import annotations
+
+import re
+from typing import Any, Optional
+from cffi_headers import (
+    cffi_fingerprint_headers,
+    cookie_names_from_session,
+    headers_for_auth_path,
+)
+from signup_protocol import (
+    AUTH_ORIGIN,
+    make_protocol_session,
+    post_signup_json,
+)
+
+SIGNUP_URL = AUTH_ORIGIN + "/sign-up?redirect=grok-com"
+DEFAULT_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
+# HTML embeds castlePk inside an escaped RSC/JSON string: castlePk\":\"pk_...
+CASTLE_PK_RE = re.compile(r'\\?"castlePk\\?"\s*:\s*\\?"(pk_[^"\\]+)\\?"')
+SITEKEY_RE = re.compile(r"0x4[0-9A-Za-z_-]{8,}")
+
+
+def open_session(har: Any, proxy_url: str, impersonate: str = "firefox135"):
+    headers = cffi_fingerprint_headers(har)
+    session = make_protocol_session(
+        proxy_url=proxy_url,
+        headers=headers,
+        impersonate=impersonate,
+    )
+    return session
+
+
+def bootstrap_signup(session, har: Any, timeout: float = 45.0) -> dict[str, Any]:
+    """GET /sign-up and keep only cookies the HTTP response actually set.
+
+    Does not invent __cuid / xai_anon_id / OptanonConsent / mixpanel / redirect.
+    """
+    headers = cffi_fingerprint_headers(har)
+    get_headers = dict(headers)
+    get_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    get_headers.pop("Content-Type", None)
+    resp = session.get(SIGNUP_URL, headers=get_headers, timeout=timeout, allow_redirects=True)
+    html = ""
+    try:
+        html = resp.text or ""
+    except Exception:
+        html = ""
+    pk_match = CASTLE_PK_RE.search(html)
+    site_match = SITEKEY_RE.search(html)
+    live = {}
+    try:
+        live = {str(k): str(v) for k, v in session.cookies.items()}
+    except Exception:
+        live = {}
+    return {
+        "status": int(getattr(resp, "status_code", 0) or 0),
+        "castle_pk": pk_match.group(1) if pk_match else "",
+        "sitekey": site_match.group(0) if site_match else "",
+        "cookie_names": cookie_names_from_session(session),
+        "http_cookies": live,
+        "final_url": str(getattr(resp, "url", "") or SIGNUP_URL),
+        "html_len": len(html),
+    }
+
+
+def post_auth(session, har: Any, built: dict, timeout: float = 45.0):
+    path = str(built.get("path") or "")
+    headers = headers_for_auth_path(har, path)
+    payload = dict(built)
+    payload["headers"] = headers
+    return post_signup_json(session, payload, timeout=timeout)
+
+
+def response_json_keys(data: Any) -> list[str]:
+    if isinstance(data, dict):
+        return sorted(data.keys())
+    return []
