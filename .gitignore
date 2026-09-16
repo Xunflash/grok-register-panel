@@ -9,6 +9,7 @@ venv/
 bin/
 .env
 .env.monitor
+/config-history/
 config.json
 accounts/*
 !accounts/.gitkeep
