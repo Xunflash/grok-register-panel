@@ -260,6 +260,17 @@ def build_send_verification_code(
     }
 
 
+def apply_live_otp(built: dict, code: str, field: str) -> dict:
+    """Keep live XXX-YYY OTP on the named JSON field. Builders strip to digits."""
+    payload = dict(built or {})
+    body = dict(payload.get("json") or {})
+    live = str(code or "").strip()
+    if "-" in live:
+        body[field] = live
+    payload["json"] = body
+    return payload
+
+
 def build_verify_email(*, email: str, code: str, extra: Optional[dict] = None) -> dict[str, Any]:
     body: dict[str, Any] = {
         "email": str(email or "").strip(),

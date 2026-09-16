@@ -62,6 +62,7 @@ done
   run_batch_headless.py \
   run_until_100.py \
   signup_scheme.py \
+  signup_protocol.py \
   sso_to_auth_json.py \
   scripts/check_bfs.py \
   scripts/check_sso_state.py \

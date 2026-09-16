@@ -17,6 +17,7 @@ from signup_protocol import (
     AUTH_SEND_CODE,
     AUTH_VERIFY_EMAIL,
     SIGNUP_PATHS,
+    apply_live_otp,
     assert_send_code_has_castle,
     build_create_account,
     build_send_verification_code,
@@ -73,9 +74,28 @@ def test_shipped_builders_match_har_auth_name_contract():
     assert send["path"] == AUTH_SEND_CODE
     assert verify["path"] == AUTH_VERIFY_EMAIL
     assert create["path"] == AUTH_CREATE_ACCOUNT
+    live_verify = apply_live_otp(verify, "123-456", "code")
+    assert live_verify["json"]["code"] == "123-456"
+    assert set(request_json_keys(live_verify)) == {"code", "email"}
+    live_create = apply_live_otp(create, "123-456", "emailValidationCode")
+    assert live_create["json"]["emailValidationCode"] == "123-456"
     blob = json.dumps({"send": send, "verify": verify, "create": create})
     assert "CreateEmailValidationCode" not in blob
     assert "CreateUserAndSessionV2" not in blob
+
+
+def _function_imported_modules(path: Path, func_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import):
+                    for alias in child.names:
+                        names.add(alias.name.split(".")[0])
+                elif isinstance(child, ast.ImportFrom) and child.module:
+                    names.add(child.module.split(".")[0])
+    return names
 
 
 def _imported_names(path: Path) -> set[str]:
@@ -127,6 +147,12 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "from playwright.sync_api" not in run_text
     assert "run_patchright_one" in run_text
     assert "def signup_with_patchright(" in engine_text
+    assert "apply_live_otp" in engine_text
+    assert "from outlook_min import apply_live_otp" not in engine_text
+    pr_imports = _function_imported_modules(engine, "signup_with_patchright")
+    assert "outlook_min" not in pr_imports
+    assert "camoufox" not in pr_imports
+    assert "patchright" in pr_imports
     assert 'cfg.get("guard_url")' in run_text
     scheme = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
     assert "SCHEME_PROTOCOL_PATCHRIGHT" in scheme
@@ -204,7 +230,76 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_succeeded({"how": "page_send_code_timeout"}, otp_visible=False) is False
 
 
+def test_signup_with_patchright_reaches_browser_without_outlook_min():
+    """Call the shipped panel entry far enough to prove apply_live_otp imported."""
+    import sys
+    import types
+
+    sys.modules.pop("outlook_min", None)
+    fake_patchright = types.ModuleType("patchright")
+    fake_api = types.ModuleType("patchright.sync_api")
+
+    class _PW:
+        def __enter__(self):
+            raise RuntimeError("sync_playwright-entered")
+
+        def __exit__(self, *args):
+            return False
+
+    fake_api.sync_playwright = lambda: _PW()
+    sys.modules["patchright"] = fake_patchright
+    sys.modules["patchright.sync_api"] = fake_api
+    from nobrowser_protocol.patchright_engine import signup_with_patchright
+
+    raised = None
+    try:
+        signup_with_patchright(
+            har={},
+            proxy="",
+            email="a@b.c",
+            wait_otp=lambda _t: "427-599",
+            solve_ts=lambda _k: "ts",
+            log=lambda _m: None,
+        )
+    except Exception as exc:
+        raised = exc
+    assert raised is not None
+    assert "outlook_min" not in str(raised)
+    assert "sync_playwright-entered" in str(raised)
+    assert "outlook_min" not in sys.modules
+
+
+def test_panel_worker_loads_patchright_otp_without_outlook_min():
+    """Panel release tree has no cffi_har_signup; worker must not need outlook_min."""
+    import importlib
+    import sys
+
+    sys.modules.pop("outlook_min", None)
+    old_path = sys.path[:]
+    sys.path[:] = [p for p in sys.path if "cffi_har_signup" not in str(p)]
+    try:
+        import signup_protocol
+
+        importlib.reload(signup_protocol)
+        live = signup_protocol.apply_live_otp(
+            signup_protocol.build_verify_email(email="a@b.c", code="427-599"),
+            "427-599",
+            "code",
+        )
+        assert live["json"]["code"] == "427-599"
+        import nobrowser_protocol.patchright_engine as pe
+
+        importlib.reload(pe)
+        assert pe.apply_live_otp is signup_protocol.apply_live_otp
+        assert callable(pe.signup_with_patchright)
+        assert "outlook_min" not in sys.modules
+    finally:
+        sys.path[:] = old_path
+
+
 if __name__ == "__main__":
     test_shipped_builders_match_har_auth_name_contract()
     test_page_engine_is_patchright_not_playwright_or_camoufox()
+    test_signup_with_patchright_reaches_browser_without_outlook_min()
+    test_panel_worker_loads_patchright_otp_without_outlook_min()
     print("OK nobrowser protocol")

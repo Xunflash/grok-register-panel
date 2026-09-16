@@ -42,6 +42,7 @@ from signup_protocol import (  # noqa: E402
     AUTH_ORIGIN,
     AUTH_SEND_CODE,
     AUTH_VERIFY_EMAIL,
+    apply_live_otp,
     assert_send_code_has_castle,
     auth_header_names_from_har,
     build_create_account,
@@ -465,8 +466,6 @@ def signup_with_patchright(
 ) -> dict:
     """HAR auth trio through Patchright Chromium. Returns email/profile/sso. No Camoufox."""
     from patchright.sync_api import sync_playwright
-
-    from outlook_min import apply_live_otp
 
     emit = log or (lambda _msg: None)
     emit("engine=patchright camoufox=no")
