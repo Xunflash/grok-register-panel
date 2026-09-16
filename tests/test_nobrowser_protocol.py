@@ -153,6 +153,8 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "outlook_min" not in pr_imports
     assert "camoufox" not in pr_imports
     assert "patchright" in pr_imports
+    assert "run_patchright_sync" in engine_text
+    assert "get_running_loop" in engine_text
     assert 'cfg.get("guard_url")' in run_text
     scheme = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
     assert "SCHEME_PROTOCOL_PATCHRIGHT" in scheme
@@ -263,10 +265,79 @@ def test_signup_with_patchright_reaches_browser_without_outlook_min():
         )
     except Exception as exc:
         raised = exc
+    finally:
+        sys.modules.pop("patchright", None)
+        sys.modules.pop("patchright.sync_api", None)
     assert raised is not None
     assert "outlook_min" not in str(raised)
     assert "sync_playwright-entered" in str(raised)
     assert "outlook_min" not in sys.modules
+
+
+def test_signup_with_patchright_survives_running_asyncio_loop():
+    """Shipped panel entry must get past Patchright driver enter inside asyncio.run()."""
+    import asyncio
+    import inspect
+    import sys
+
+    sys.modules.pop("patchright", None)
+    sys.modules.pop("patchright.sync_api", None)
+    from nobrowser_protocol.patchright_engine import run_patchright_sync, signup_with_patchright
+
+    src = inspect.getsource(signup_with_patchright)
+    assert "run_patchright_sync" in src
+    assert "from patchright.sync_api import sync_playwright" in src
+    assert "from playwright.sync_api" not in src
+
+    hop = {}
+
+    async def prove_hop():
+        def body():
+            try:
+                asyncio.get_running_loop()
+                hop["child_loop"] = True
+            except RuntimeError:
+                hop["child_loop"] = False
+            hop["thread"] = __import__("threading").current_thread().name
+            return "hop-ok"
+
+        return run_patchright_sync(body)
+
+    assert asyncio.run(prove_hop()) == "hop-ok"
+    assert hop.get("child_loop") is False
+    assert hop.get("thread") == "patchright-sync"
+
+    logs: list[str] = []
+    errors: list[str] = []
+
+    async def call_shipped_entry():
+        try:
+            signup_with_patchright(
+                har={},
+                proxy="",
+                email="asyncio-loop@example.com",
+                wait_otp=lambda _t: "000-000",
+                solve_ts=lambda _k: "ts",
+                log=logs.append,
+            )
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    asyncio.run(call_shipped_entry())
+    blob = "\n".join(logs + errors)
+    assert "Playwright Sync API inside the asyncio loop" not in blob
+    assert "inside the asyncio loop" not in blob
+    assert any("engine=patchright" in msg for msg in logs)
+    try:
+        import patchright  # noqa: F401
+
+        have_patchright = True
+    except ImportError:
+        have_patchright = False
+    if have_patchright:
+        assert any("patchright driver entered" in msg for msg in logs), blob[:2000]
+    else:
+        assert errors and "patchright" in errors[0].lower()
 
 
 def test_panel_worker_loads_patchright_otp_without_outlook_min():
@@ -301,5 +372,6 @@ if __name__ == "__main__":
     test_shipped_builders_match_har_auth_name_contract()
     test_page_engine_is_patchright_not_playwright_or_camoufox()
     test_signup_with_patchright_reaches_browser_without_outlook_min()
+    test_signup_with_patchright_survives_running_asyncio_loop()
     test_panel_worker_loads_patchright_otp_without_outlook_min()
     print("OK nobrowser protocol")

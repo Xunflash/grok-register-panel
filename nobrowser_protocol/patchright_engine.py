@@ -6,6 +6,7 @@ in-page fetch (same as protocol_register_once, different browser).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -13,9 +14,10 @@ import shutil
 import string
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +56,40 @@ from signup_protocol import (  # noqa: E402
 )
 
 SIGNUP_URL = AUTH_ORIGIN + "/sign-up?redirect=grok-com"
+_T = TypeVar("_T")
+
+
+def _asyncio_loop_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def run_patchright_sync(fn: Callable[[], _T]) -> _T:
+    """Run Patchright sync API off a thread that already has a running asyncio loop.
+
+    Panel workers import Camoufox/Playwright and can already be inside a loop.
+    Patchright's sync_playwright() then raises Sync API inside the asyncio loop.
+    A fresh thread has no running loop, so driver enter can proceed.
+    """
+    if not _asyncio_loop_running():
+        return fn()
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_target, name="patchright-sync", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 FIRST = "James Mary Robert Patricia John Jennifer Michael Linda David Elizabeth".split()
 LAST = "Smith Johnson Williams Brown Jones Garcia Miller Davis Wilson Anderson".split()
 
@@ -465,10 +501,21 @@ def signup_with_patchright(
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """HAR auth trio through Patchright Chromium. Returns email/profile/sso. No Camoufox."""
-    from patchright.sync_api import sync_playwright
-
     emit = log or (lambda _msg: None)
     emit("engine=patchright camoufox=no")
+    if _asyncio_loop_running():
+        return run_patchright_sync(
+            lambda: signup_with_patchright(
+                har=har,
+                proxy=proxy,
+                email=email,
+                wait_otp=wait_otp,
+                solve_ts=solve_ts,
+                log=log,
+            )
+        )
+    from patchright.sync_api import sync_playwright
+
     pw = _rand_password()
     given = random.choice(FIRST)
     family = random.choice(LAST)
@@ -478,6 +525,7 @@ def signup_with_patchright(
     chrome = _chrome_path()
     sso = ""
     with sync_playwright() as playwright:
+        emit("patchright driver entered")
         launch_kw: dict[str, Any] = {
             "headless": not headed,
             "no_viewport": True,
