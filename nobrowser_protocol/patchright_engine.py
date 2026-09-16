@@ -6,9 +6,12 @@ in-page fetch (same as protocol_register_once, different browser).
 """
 from __future__ import annotations
 
+import json
+import os
 import random
 import string
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -23,9 +26,13 @@ if str(CFFI) not in sys.path:
 
 from nobrowser_protocol.page_sdk import (  # noqa: E402
     CASTLE_MINT_JS,
+    CLICK_VISIBLE_JS,
+    DUMP_PAGE_JS,
+    FILL_EMAIL_JS,
     PAGE_POST_JS,
     SENTRY_JS,
     SITEKEY_JS,
+    SUBMIT_EMAIL_JS,
 )
 from signup_protocol import (  # noqa: E402
     AUTH_CREATE_ACCOUNT,
@@ -74,6 +81,204 @@ def _proxy_for_patchright(proxy_url: str) -> dict | None:
     return out
 
 
+COOKIE_NEEDLES = ("Reject All", "Accept All Cookies", "Accept All", "Reject")
+EMAIL_ENTRY_NEEDLES = (
+    "Sign up with email",
+    "Continue with email",
+    "Use email",
+    "使用邮箱注册",
+    "使用邮箱",
+    "邮箱注册",
+)
+SUBMIT_NEEDLES = ("Continue", "Next", "Sign up", "Create account", "继续", "下一步", "注册")
+SUBMIT_DENY = (
+    "with email",
+    "with apple",
+    "with google",
+    "with x",
+    "privacy",
+    "go back",
+    "使用邮箱",
+)
+
+
+def _js_click(page, needles: tuple[str, ...], deny: tuple[str, ...] = (), timeout: int = 4000) -> str:
+    deadline = time.time() + (timeout / 1000.0)
+    last = ""
+    while time.time() < deadline:
+        try:
+            last = str(page.evaluate(CLICK_VISIBLE_JS, {"needles": list(needles), "deny": list(deny)}) or "")
+        except Exception:
+            last = ""
+        if last:
+            return last
+        page.wait_for_timeout(250)
+    return last
+
+
+def _click_first(
+    page,
+    names: tuple[str, ...],
+    timeout: int = 4000,
+    deny: tuple[str, ...] = (),
+) -> str:
+    hit = _js_click(page, names, deny=deny, timeout=timeout)
+    if hit:
+        return hit
+    skip = tuple(x.lower() for x in deny)
+    for name in names:
+        loc = page.get_by_role("button", name=name, exact=False)
+        try:
+            if loc.count() == 0:
+                loc = page.get_by_text(name, exact=False)
+            loc.first.wait_for(state="visible", timeout=min(timeout, 1500))
+            label = ""
+            try:
+                label = str(loc.first.inner_text(timeout=500) or name)
+            except Exception:
+                label = name
+            compact = label.replace(" ", "").lower()
+            if any(item.replace(" ", "").lower() in compact for item in skip if item):
+                continue
+            loc.first.click(timeout=timeout)
+            return label or name
+        except Exception:
+            continue
+    return ""
+
+
+def _dump_page(page, log: Callable[[str], None], prefix: str) -> None:
+    try:
+        dump = page.evaluate(DUMP_PAGE_JS)
+    except Exception as exc:
+        log(f"{prefix} dump_error={exc}")
+        return
+    log(f"{prefix} {json.dumps(dump, ensure_ascii=False)[:700]}")
+
+
+def _open_email_form(page, log: Callable[[str], None]) -> None:
+    cookie = _click_first(page, COOKIE_NEEDLES, timeout=2500)
+    if cookie:
+        log(f"cookie banner click={cookie!r}")
+        page.wait_for_timeout(500)
+    opened = _click_first(page, EMAIL_ENTRY_NEEDLES, timeout=8000)
+    if opened:
+        log(f"email entry click={opened!r}")
+        page.wait_for_timeout(800)
+    else:
+        _dump_page(page, log, "email-entry-miss")
+
+
+def _capture_auth_headers(captured: dict[str, Any], request) -> None:
+    url = str(request.url or "")
+    if "/api/auth/" not in url:
+        return
+    headers = request.headers or {}
+    sentry_trace = str(headers.get("sentry-trace") or headers.get("sentry_trace") or "").strip()
+    baggage = str(headers.get("baggage") or "").strip()
+    if sentry_trace:
+        captured["sentry_trace"] = sentry_trace
+        captured["baggage"] = baggage
+        captured["sentry_how"] = "page_request_headers"
+    if AUTH_SEND_CODE not in url or str(request.method or "").upper() != "POST":
+        return
+    try:
+        body = request.post_data_json
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raw = request.post_data or ""
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+    captured["json"] = body
+    captured["url"] = url
+
+
+def _castle_from_capture_or_mint(captured: dict | None, minted: dict | None) -> dict:
+    """Prefer live send-code XHR castle; only then Castle SDK evaluate."""
+    cap = captured or {}
+    token = str(cap.get("token") or "").strip()
+    if token:
+        return {
+            "token": token,
+            "how": str(cap.get("how") or "page_send_code_request"),
+            "pk": str(cap.get("pk") or ""),
+        }
+    mint = minted or {}
+    return {
+        "token": str(mint.get("token") or "").strip(),
+        "how": str(mint.get("how") or "missing"),
+        "pk": str(mint.get("pk") or ""),
+    }
+
+
+def _capture_send_code(page, email: str, log: Callable[[str], None], timeout: float = 45.0) -> dict:
+    """Let the live page SDK fire send-code; capture castleRequestToken from that XHR."""
+    captured: dict[str, Any] = {}
+
+    def on_request(request):
+        _capture_auth_headers(captured, request)
+
+    page.on("request", on_request)
+    try:
+        _open_email_form(page, log)
+        loc = page.locator(
+            'input[type="email"], input[name="email"], input[data-testid="email"], input[autocomplete="email"]'
+        ).first
+        loc.wait_for(state="visible", timeout=20000)
+        filled = False
+        try:
+            loc.fill(email, timeout=8000)
+            filled = True
+        except Exception as exc:
+            log(f"locator fill: {exc}")
+        if not filled:
+            react = page.evaluate(FILL_EMAIL_JS, email)
+            log(f"react fill={react!r}")
+        clicked = ""
+        try:
+            submit = page.locator('button[type="submit"]').first
+            if submit.count() > 0:
+                submit.wait_for(state="visible", timeout=3000)
+                clicked = str(submit.inner_text(timeout=1000) or "submit")
+                submit.click(timeout=5000)
+        except Exception:
+            clicked = ""
+        if not clicked:
+            clicked = _click_first(page, SUBMIT_NEEDLES, timeout=5000, deny=SUBMIT_DENY)
+        if not clicked:
+            clicked = str(page.evaluate(SUBMIT_EMAIL_JS) or "js-submit")
+        log(f"email submit click={clicked!r}")
+    except Exception as exc:
+        log(f"page fill/submit: {exc}")
+        _dump_page(page, log, "fill-submit-fail")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        token = str(((captured.get("json") or {}).get("castleRequestToken")) or "").strip()
+        if token:
+            log(f"castle how=page_send_code_request len={len(token)}")
+            return {
+                "token": token,
+                "how": "page_send_code_request",
+                "json": captured.get("json"),
+                "sentry_trace": captured.get("sentry_trace") or "",
+                "baggage": captured.get("baggage") or "",
+                "sentry_how": captured.get("sentry_how") or "",
+            }
+        time.sleep(0.4)
+    _dump_page(page, log, "send-code-timeout")
+    return {
+        "token": "",
+        "how": "page_send_code_timeout",
+        "json": captured.get("json") or {},
+        "sentry_trace": captured.get("sentry_trace") or "",
+        "baggage": captured.get("baggage") or "",
+        "sentry_how": captured.get("sentry_how") or "",
+    }
+
+
 def _mint_castle(page, email: str, log: Callable[[str], None], timeout: float = 45.0) -> dict:
     deadline = time.time() + timeout
     last = {"token": "", "how": "missing", "pk": ""}
@@ -113,13 +318,31 @@ def _post(page, har: Any, built: dict, sentry: dict, log: Callable[[str], None])
     if sentry.get("baggage"):
         live["baggage"] = sentry["baggage"]
     headers = fetch_settable_headers(auth_header_names_from_har(har), live)
-    result = page.evaluate(
-        PAGE_POST_JS,
-        {"url": built["url"], "body": built.get("json") or {}, "headers": headers},
-    )
-    status, data, raw = parse_inpage_post_result(result)
-    log(f"post {built.get('path')} status={status}")
-    return status, data, raw
+    payload = {"url": built["url"], "body": built.get("json") or {}, "headers": headers}
+    try:
+        result = page.evaluate(PAGE_POST_JS, payload)
+        status, data, raw = parse_inpage_post_result(result)
+        log(f"post {built.get('path')} status={status} how=evaluate")
+        if status:
+            return status, data, raw
+    except Exception as exc:
+        log(f"post evaluate: {exc}")
+    try:
+        resp = page.request.post(
+            built["url"],
+            headers={**headers, "content-type": "application/json"},
+            data=json.dumps(payload["body"]),
+        )
+        text = resp.text()
+        try:
+            data = resp.json()
+        except Exception:
+            data = text
+        log(f"post {built.get('path')} status={resp.status} how=context_request")
+        return int(resp.status), data, text
+    except Exception as exc:
+        log(f"post request: {exc}")
+        return 0, {"error": str(exc)}, None
 
 
 def run_patchright_one(
@@ -150,20 +373,58 @@ def run_patchright_one(
     given = random.choice(FIRST)
     family = random.choice(LAST)
     proxy_cfg = _proxy_for_patchright(proxy)
+    user_dir = tempfile.mkdtemp(prefix="patchright-ctx-")
+    headed = bool(os.environ.get("DISPLAY") or os.environ.get("PATCHRIGHT_HEADED"))
+    chrome = str(os.environ.get("PATCHRIGHT_CHROME") or "").strip()
     with sync_playwright() as playwright:
-        launch_kw: dict[str, Any] = {"headless": True}
+        launch_kw: dict[str, Any] = {
+            "headless": not headed,
+            "no_viewport": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
         if proxy_cfg:
             launch_kw["proxy"] = proxy_cfg
-        browser = playwright.chromium.launch(**launch_kw)
+        if chrome:
+            launch_kw["executable_path"] = chrome
+        context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
+        browser = context.browser
         try:
-            context = browser.new_context()
-            page = context.new_page()
-            page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
-            castle = _mint_castle(page, email, emit)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+            try:
+                page.wait_for_function(
+                    "() => /castlePk/.test(document.documentElement.innerHTML) || !!(window.Castle && window.Castle.createRequestToken)",
+                    timeout=30000,
+                )
+            except Exception as exc:
+                emit(f"castlePk wait: {exc}")
+            page.wait_for_timeout(1500)
+            # Patchright isolates Runtime.enable, so window.Castle is often
+            # invisible to evaluate. Prefer the live page XHR as Castle source.
+            emit("capture live send-code XHR from page submit")
+            captured = _capture_send_code(page, email, emit, timeout=45.0)
+            minted = {}
+            sent_via_page = bool(str(captured.get("token") or "").strip())
+            if not sent_via_page:
+                emit("page XHR empty; try Castle SDK evaluate")
+                minted = _mint_castle(page, email, emit, timeout=8.0)
+            castle = _castle_from_capture_or_mint(captured, minted)
             if not castle.get("token"):
-                raise RuntimeError(f"patchright castle SDK empty how={castle.get('how')}")
+                title = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    title = ""
+                raise RuntimeError(
+                    f"patchright castle SDK empty how={castle.get('how')} title={title!r} url={page.url}"
+                )
             sentry = _sentry(page)
+            if captured.get("sentry_trace"):
+                sentry = {
+                    "sentry_trace": captured.get("sentry_trace") or "",
+                    "baggage": captured.get("baggage") or "",
+                    "how": captured.get("sentry_how") or "page_request_headers",
+                }
             emit(f"sentry how={sentry.get('how')}")
             try:
                 sitekey = str(page.evaluate(SITEKEY_JS) or "").strip()
@@ -174,9 +435,13 @@ def run_patchright_one(
             )
             assert_send_code_has_castle(send)
             sent_at = time.time()
-            st, data, _raw = _post(page, har, send, sentry, emit)
-            if st >= 400 or st == 0:
-                raise RuntimeError(f"send-code {st} {str(data)[:180]}")
+            if sent_via_page:
+                emit("send-code already fired by live page SDK")
+                st, data = 200, {"captured": True}
+            else:
+                st, data, _raw = _post(page, har, send, sentry, emit)
+                if st >= 400 or st == 0:
+                    raise RuntimeError(f"send-code {st} {str(data)[:180]}")
             code = str(account.get("otp") or "").strip() or wait_for_code(account, after_ts=sent_at)
             emit(f"otp len={len(code)}")
             verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
@@ -219,7 +484,12 @@ def run_patchright_one(
                 )
             emit(f"sso len={len(sso)}")
         finally:
-            browser.close()
+            context.close()
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
     session = make_protocol_session(proxy_url=proxy)
     onboard = onboard_new_account(session, sso)

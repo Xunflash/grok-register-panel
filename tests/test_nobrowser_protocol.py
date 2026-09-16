@@ -107,18 +107,43 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
         assert "browser_session" not in imported
     engine_text = engine.read_text(encoding="utf-8")
     run_text = run.read_text(encoding="utf-8")
+    sdk_text = (ROOT / "nobrowser_protocol" / "page_sdk.py").read_text(encoding="utf-8")
     assert "from patchright.sync_api import sync_playwright" in engine_text
     assert "from playwright.sync_api" not in engine_text
+    assert "Sign up with email" in engine_text
+    assert "page_send_code_request" in engine_text
+    assert "page_request_headers" in engine_text
+    assert "_castle_from_capture_or_mint" in engine_text
+    assert "with apple" in engine_text
+    assert "CLICK_VISIBLE_JS" in sdk_text
+    assert "SUBMIT_EMAIL_JS" in sdk_text
     assert "import playwright" not in engine_text
     assert "python -m playwright install" not in engine_text
     assert "python -m playwright install" not in run_text
     assert "from playwright.sync_api" not in run_text
     assert "run_patchright_one" in run_text
     from nobrowser_protocol.cffi_engine import camoufox_imports
-    from nobrowser_protocol.patchright_engine import camoufox_imports as pr_camoufox
+    from nobrowser_protocol.patchright_engine import (
+        _castle_from_capture_or_mint,
+        camoufox_imports as pr_camoufox,
+    )
 
     assert camoufox_imports() == ()
     assert pr_camoufox() == ()
+    live = _castle_from_capture_or_mint(
+        {"token": "from-xhr", "how": "page_send_code_request"},
+        {"token": "from-mint", "how": "Castle.createRequestToken"},
+    )
+    assert live["token"] == "from-xhr"
+    assert live["how"] == "page_send_code_request"
+    minted = _castle_from_capture_or_mint(
+        {"token": "", "how": "page_send_code_timeout"},
+        {"token": "from-mint", "how": "Castle.createRequestToken", "pk": "pk_x"},
+    )
+    assert minted["token"] == "from-mint"
+    assert minted["how"] == "Castle.createRequestToken"
+    empty = _castle_from_capture_or_mint({}, {})
+    assert empty["token"] == ""
 
 
 if __name__ == "__main__":
