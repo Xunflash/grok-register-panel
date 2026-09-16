@@ -9,7 +9,7 @@ from webui.security_utils import redact_log_line
 
 SCALARS = {"base_cpa", "base_cpa_stale", "cpa", "cpa_delta", "target", "done_attempts", "progress_pct", "success_rate", "rate_per_min", "eta", "workers", "ok", "fail", "domain", "skip", "bot0", "bot1", "bfs"}
 CONTROL = {"workers", "batch_count", "add_count", "risk_pause", "mode", "turnstile_provider", "registration_scheme", "stop_min_accounts", "stop_min_success_rate", "debug_mode"}
-CONTROL_ENUMS = {"mode": {"orch", "batch"}, "turnstile_provider": {"capsolver", "yescaptcha", "local"}, "registration_scheme": {"browser", "protocol"}}
+CONTROL_ENUMS = {"mode": {"orch", "batch"}, "turnstile_provider": {"capsolver", "yescaptcha", "local"}, "registration_scheme": {"browser", "protocol", "protocol_patchright"}}
 TRAFFIC = {"running", "bytes_up", "bytes_down", "bytes_total", "connections", "active_connections", "metered_proxies", "unmetered_proxies", "target", "workers", "successful_accounts", "batch_count", "completed_batches", "bytes_per_batch", "bytes_per_success", "total_batches"}
 
 

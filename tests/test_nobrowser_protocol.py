@@ -126,7 +126,14 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "python -m playwright install" not in run_text
     assert "from playwright.sync_api" not in run_text
     assert "run_patchright_one" in run_text
+    assert "def signup_with_patchright(" in engine_text
     assert 'cfg.get("guard_url")' in run_text
+    scheme = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
+    assert "SCHEME_PROTOCOL_PATCHRIGHT" in scheme
+    assert "signup_with_patchright" in scheme
+    from webui.api_projection import CONTROL_ENUMS
+
+    assert "protocol_patchright" in CONTROL_ENUMS["registration_scheme"]
     from nobrowser_protocol.cffi_engine import camoufox_imports
     from nobrowser_protocol.patchright_engine import (
         _castle_from_capture_or_mint,
@@ -150,6 +157,47 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert minted["how"] == "Castle.createRequestToken"
     empty = _castle_from_capture_or_mint({}, {})
     assert empty["token"] == ""
+    from signup_scheme import (
+        ENV_NAME,
+        SCHEME_PROTOCOL,
+        SCHEME_PROTOCOL_PATCHRIGHT,
+        maybe_run_protocol_signup,
+        resolve_registration_scheme,
+    )
+
+    assert resolve_registration_scheme("协议注册（patchright）") == SCHEME_PROTOCOL_PATCHRIGHT
+    assert resolve_registration_scheme("patchwright") == SCHEME_PROTOCOL_PATCHRIGHT
+    assert resolve_registration_scheme("协议注册") == SCHEME_PROTOCOL
+    os_environ = __import__("os").environ
+    old = os_environ.get(ENV_NAME)
+    os_environ[ENV_NAME] = SCHEME_PROTOCOL_PATCHRIGHT
+    try:
+        events = []
+
+        def boom(*_a, **_k):
+            events.append("camoufox")
+            raise AssertionError("camoufox")
+
+        def fake_run(log_callback=None, cancel_callback=None):
+            events.append("patchright")
+            return {"email": "a@b.c", "profile": {"password": "pw"}, "sso": "sso"}
+
+        import signup_scheme as scheme_mod
+        from unittest.mock import patch
+
+        with patch.object(scheme_mod, "_prepare_protocol_browser", boom), patch.object(
+            scheme_mod, "_close_protocol_browser", boom
+        ), patch.object(scheme_mod, "_load_protocol_signup", boom), patch.object(
+            scheme_mod, "_load_patchright_signup", lambda: fake_run
+        ):
+            out = maybe_run_protocol_signup(lambda _m: None, lambda: False)
+        assert events == ["patchright"]
+        assert out["scheme"] == SCHEME_PROTOCOL_PATCHRIGHT
+    finally:
+        if old is None:
+            os_environ.pop(ENV_NAME, None)
+        else:
+            os_environ[ENV_NAME] = old
     assert _send_code_succeeded({"token": "x"}) is True
     assert _send_code_succeeded({"how": "page_otp_form"}) is True
     assert _send_code_succeeded({}, otp_visible=True) is True

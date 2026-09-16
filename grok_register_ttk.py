@@ -129,6 +129,7 @@ from signup_scheme import (
     SCHEME_BROWSER,
     SCHEME_LABELS,
     SCHEME_PROTOCOL,
+    SCHEME_PROTOCOL_PATCHRIGHT,
     load_registration_scheme,
     maybe_run_protocol_signup,
     resolve_registration_scheme,
@@ -3260,7 +3261,10 @@ class GrokRegisterGUI:
             value=str(config.get("registration_scheme") or SCHEME_BROWSER)
         )
         self.registration_scheme_combo = tk_option_menu(
-            opt_frame, self.registration_scheme_var, [SCHEME_BROWSER, SCHEME_PROTOCOL], width=10
+            opt_frame,
+            self.registration_scheme_var,
+            [SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT],
+            width=18,
         )
         self.registration_scheme_combo.pack(side=tk.LEFT)
 

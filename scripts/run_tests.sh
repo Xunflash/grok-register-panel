@@ -41,6 +41,8 @@ tests=(
   tests/test_batch_supervisor.py
   tests/test_orchestrator_policy.py
   tests/test_nobrowser_protocol.py
+  tests/test_signup_scheme.py
+  tests/test_registration_scheme_panel.py
 )
 
 for test_file in "${tests[@]}"; do
@@ -59,6 +61,7 @@ done
   batch_supervisor.py \
   run_batch_headless.py \
   run_until_100.py \
+  signup_scheme.py \
   sso_to_auth_json.py \
   scripts/check_bfs.py \
   scripts/check_sso_state.py \

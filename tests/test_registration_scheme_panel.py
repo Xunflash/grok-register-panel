@@ -9,9 +9,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from webui import monitor  # noqa: E402
-from signup_scheme import ENV_NAME, SCHEME_BROWSER, SCHEME_PROTOCOL  # noqa: E402
-import grok_register_ttk as register  # noqa: E402
+from signup_scheme import (  # noqa: E402
+    ENV_NAME,
+    SCHEME_BROWSER,
+    SCHEME_PROTOCOL,
+    SCHEME_PROTOCOL_PATCHRIGHT,
+)
 
 
 def test_monitor_html_exposes_registration_scheme_select():
@@ -20,12 +23,15 @@ def test_monitor_html_exposes_registration_scheme_select():
     assert 'id="registration_scheme"' in html
     assert 'value="browser">浏览器注册</option>' in html
     assert 'value="protocol">协议注册</option>' in html
+    assert 'value="protocol_patchright">协议注册（patchright）</option>' in html
     assert "registration_scheme:" in mon
     assert "fillControl" in mon
     assert 'document.getElementById("registration_scheme")' in mon
 
 
 def test_save_control_and_registration_env_use_panel_scheme(tmp_path, monkeypatch):
+    from webui import monitor
+
     control_file = tmp_path / "monitor_control.json"
     cfg = tmp_path / "config.json"
     cfg.write_text(
@@ -53,8 +59,17 @@ def test_save_control_and_registration_env_use_panel_scheme(tmp_path, monkeypatc
     env_browser = monitor._registration_env()
     assert env_browser[ENV_NAME] == SCHEME_BROWSER
 
+    saved_pr = monitor.save_control({"registration_scheme": "协议注册（patchright）"})
+    assert saved_pr["registration_scheme"] == SCHEME_PROTOCOL_PATCHRIGHT
+    env_pr = monitor._registration_env()
+    assert env_pr[ENV_NAME] == SCHEME_PROTOCOL_PATCHRIGHT
+    assert env_pr.get("GROK_FP_ENHANCE") == "0"
+    assert env_pr.get("PATCHRIGHT_HEADED") == "1"
+
 
 def test_signup_until_sso_reads_config_when_env_missing(monkeypatch):
+    import grok_register_ttk as register
+
     monkeypatch.delenv(ENV_NAME, raising=False)
     previous = register.config.get("registration_scheme")
     register.config["registration_scheme"] = SCHEME_PROTOCOL
@@ -88,6 +103,8 @@ def test_signup_until_sso_reads_config_when_env_missing(monkeypatch):
 
 
 def test_signup_until_sso_protocol_skips_browser_path(monkeypatch):
+    import grok_register_ttk as register
+
     calls = []
 
     def fake_protocol(**_kwargs):
@@ -113,6 +130,8 @@ def test_signup_until_sso_protocol_skips_browser_path(monkeypatch):
 
 
 def test_signup_until_sso_browser_when_protocol_returns_none(monkeypatch):
+    import grok_register_ttk as register
+
     calls = []
 
     def fake_protocol(**_kwargs):
@@ -146,5 +165,16 @@ def test_workers_call_signup_until_sso():
     assert "registration_scheme_var" in text
     assert 'SCHEME_PROTOCOL' in text or '"protocol"' in text
     example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
-    assert example["registration_scheme"] in {SCHEME_BROWSER, SCHEME_PROTOCOL}
-    assert register.DEFAULT_CONFIG["registration_scheme"] == SCHEME_BROWSER
+    assert example["registration_scheme"] in {
+        SCHEME_BROWSER,
+        SCHEME_PROTOCOL,
+        SCHEME_PROTOCOL_PATCHRIGHT,
+    }
+    assert "SCHEME_PROTOCOL_PATCHRIGHT" in text or "protocol_patchright" in text
+    assert '"registration_scheme": "browser"' in text
+
+
+if __name__ == "__main__":
+    test_monitor_html_exposes_registration_scheme_select()
+    test_workers_call_signup_until_sso()
+    print("OK registration scheme panel")

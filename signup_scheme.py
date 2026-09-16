@@ -9,8 +9,9 @@ from typing import Any, Callable, Optional
 
 SCHEME_BROWSER = "browser"
 SCHEME_PROTOCOL = "protocol"
+SCHEME_PROTOCOL_PATCHRIGHT = "protocol_patchright"
 ENV_NAME = "GROK_REGISTRATION_SCHEME"
-VALID_SCHEMES = (SCHEME_BROWSER, SCHEME_PROTOCOL)
+VALID_SCHEMES = (SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT)
 
 SCHEME_ALIASES = {
     "browser": SCHEME_BROWSER,
@@ -29,11 +30,18 @@ SCHEME_ALIASES = {
     "协议": SCHEME_PROTOCOL,
     "协议方案": SCHEME_PROTOCOL,
     "协议注册": SCHEME_PROTOCOL,
+    "protocol_patchright": SCHEME_PROTOCOL_PATCHRIGHT,
+    "protocol-patchright": SCHEME_PROTOCOL_PATCHRIGHT,
+    "patchright": SCHEME_PROTOCOL_PATCHRIGHT,
+    "patchwright": SCHEME_PROTOCOL_PATCHRIGHT,
+    "协议注册（patchright）": SCHEME_PROTOCOL_PATCHRIGHT,
+    "协议注册(patchright)": SCHEME_PROTOCOL_PATCHRIGHT,
 }
 
 SCHEME_LABELS = {
     SCHEME_BROWSER: "浏览器注册",
     SCHEME_PROTOCOL: "协议注册",
+    SCHEME_PROTOCOL_PATCHRIGHT: "协议注册（patchright）",
 }
 
 
@@ -95,6 +103,83 @@ def _load_protocol_signup() -> Callable[..., dict]:
     return run_protocol_signup
 
 
+def _load_patchright_signup() -> Callable[..., dict]:
+    return _run_patchright_signup
+
+
+def _run_patchright_signup(
+    log_callback: Optional[Callable[[str], Any]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """Panel worker entry: panel mailbox/proxy/Turnstile + Patchright HAR trio."""
+    from browser_session import get_bound_proxy
+    from grok_register_ttk import get_email_and_token, get_oai_code
+    from nobrowser_protocol.patchright_engine import SIGNUP_URL, signup_with_patchright
+    from signup_protocol import load_har
+    from turnstile_solver import solve_turnstile as panel_solve_turnstile
+
+    emit = log_callback or (lambda _m: None)
+
+    def _cancel() -> None:
+        if callable(cancel_callback) and cancel_callback():
+            raise RuntimeError("stopped")
+
+    _cancel()
+    email, mail_token = get_email_and_token()
+    emit(f"[*] patchright mailbox {email}")
+    proxy = get_bound_proxy()
+    har_path = None
+    root = Path(__file__).resolve().parent
+    for candidate in (
+        root / "log" / "signup-protocol-full.har",
+        root / "log" / "signup-protocol.har",
+        root / "tests" / "fixtures" / "signup_har_excerpt.json",
+    ):
+        if candidate.is_file():
+            har_path = candidate
+            break
+    if har_path is None:
+        raise RuntimeError("protocol HAR missing for patchright signup")
+    har = load_har(har_path)
+
+    def wait_otp(_after_ts: float) -> str:
+        _cancel()
+        return get_oai_code(
+            mail_token,
+            email,
+            log_callback=emit,
+            cancel_callback=cancel_callback,
+        )
+
+    def solve_ts(sitekey: str) -> str:
+        _cancel()
+        return panel_solve_turnstile(
+            SIGNUP_URL,
+            sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
+            log=emit,
+            cancel=_cancel,
+        )
+
+    outcome = signup_with_patchright(
+        har=har,
+        proxy=proxy,
+        email=email,
+        wait_otp=wait_otp,
+        solve_ts=solve_ts,
+        log=emit,
+    )
+    return {
+        "email": outcome["email"],
+        "profile": {
+            "password": outcome["password"],
+            "given_name": outcome["given_name"],
+            "family_name": outcome["family_name"],
+        },
+        "sso": outcome["sso"],
+        "scheme": SCHEME_PROTOCOL_PATCHRIGHT,
+    }
+
+
 def _prepare_protocol_browser(log_fn: Callable[[str], Any]) -> None:
     from browser_session import active_browser, restart_browser, start_browser
 
@@ -122,7 +207,19 @@ def maybe_run_protocol_signup(
     Browser scheme returns None so the caller keeps the original Camoufox path.
     """
     log_fn = log_callback or (lambda _m: None)
-    if load_registration_scheme() != SCHEME_PROTOCOL:
+    scheme = load_registration_scheme()
+    if scheme == SCHEME_PROTOCOL_PATCHRIGHT:
+        log_fn(
+            f"[*] 注册方案: {SCHEME_LABELS[SCHEME_PROTOCOL_PATCHRIGHT]}"
+            "（Patchright Chromium HAR 回放，Turnstile 走云打码，不启动 Camoufox）"
+        )
+        runner = _load_patchright_signup()
+        result = runner(log_callback=log_fn, cancel_callback=cancel_callback)
+        if not isinstance(result, dict) or not result.get("sso"):
+            raise RuntimeError("patchright signup returned no sso")
+        result.setdefault("scheme", SCHEME_PROTOCOL_PATCHRIGHT)
+        return result
+    if scheme != SCHEME_PROTOCOL:
         return None
     log_fn(f"[*] 注册方案: {SCHEME_LABELS[SCHEME_PROTOCOL]}（HAR 回放，Turnstile 走云打码）")
     _prepare_protocol_browser(log_fn)

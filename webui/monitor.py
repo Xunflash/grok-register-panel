@@ -811,15 +811,26 @@ def _registration_env() -> dict[str, str]:
     except Exception:
         pass
     try:
-        from signup_scheme import ENV_NAME, SCHEME_PROTOCOL, resolve_registration_scheme
+        from signup_scheme import (
+            ENV_NAME,
+            SCHEME_PROTOCOL,
+            SCHEME_PROTOCOL_PATCHRIGHT,
+            resolve_registration_scheme,
+        )
 
         control = load_control()
         scheme = resolve_registration_scheme(
             control.get("registration_scheme") or "browser"
         )
         env[ENV_NAME] = scheme
-        if scheme == SCHEME_PROTOCOL:
+        if scheme in {SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT}:
             env["GROK_FP_ENHANCE"] = "0"
+        if scheme == SCHEME_PROTOCOL_PATCHRIGHT:
+            env.setdefault("PATCHRIGHT_HEADED", "1")
+            for chrome in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+                if Path(chrome).is_file():
+                    env.setdefault("PATCHRIGHT_CHROME", chrome)
+                    break
         debug_mode = _coerce_debug_mode(control.get("debug_mode"))
         if debug_mode:
             env["GROK_DEBUG_MODE"] = "1"
@@ -2198,9 +2209,10 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="field">
         <label for="registration_scheme">注册方案</label>
-        <select id="registration_scheme" title="浏览器注册=Camoufox 表单点击；协议注册=HAR 回放发码/建号，Turnstile 仍走云打码。">
+        <select id="registration_scheme" title="浏览器注册=Camoufox 表单点击；协议注册=Camoufox HAR 回放发码/建号；协议注册（patchright）=Patchright Chromium HAR 回放。Turnstile 仍走云打码。">
           <option value="browser">浏览器注册</option>
           <option value="protocol">协议注册</option>
+          <option value="protocol_patchright">协议注册（patchright）</option>
         </select>
       </div>
       <div class="field"><label for="batch_count">单批数量</label>

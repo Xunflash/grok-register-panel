@@ -3,6 +3,13 @@ from pathlib import Path
 import re, sys
 ROOT = Path(__file__).resolve().parents[1]
 
+def test_registration_scheme_includes_patchright_option():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'value="protocol_patchright">协议注册（patchright）</option>' in html
+    assert 'id="registration_scheme"' in html
+
+
 def test_workers_dom_ids_unique():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     assert 'id="workers-input"' in mon

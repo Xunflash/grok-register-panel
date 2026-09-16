@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import string
 import sys
 import tempfile
@@ -431,37 +432,52 @@ def _post(page, har: Any, built: dict, sentry: dict, log: Callable[[str], None])
         return 0, {"error": str(exc)}, None
 
 
-def run_patchright_one(
+def _chrome_path() -> str:
+    env = str(os.environ.get("PATCHRIGHT_CHROME") or "").strip()
+    if env:
+        return env
+    for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"):
+        if Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def _default_har_path() -> Path:
+    for candidate in (
+        ROOT / "log" / "signup-protocol-full.har",
+        ROOT / "log" / "signup-protocol.har",
+        ROOT / "tests" / "fixtures" / "signup_har_excerpt.json",
+        ROOT / "cffi_har_signup" / "tests" / "fixtures" / "signup_har_excerpt.json",
+    ):
+        if candidate.is_file():
+            return candidate
+    return ROOT / "log" / "signup-protocol-full.har"
+
+
+def signup_with_patchright(
     *,
     har: Any,
     proxy: str,
-    account: dict,
-    capsolver_key: str,
-    capsolver_api: str,
-    guard_url: str,
-    guard_token: str,
-    grok2api: dict | None = None,
+    email: str,
+    wait_otp: Callable[[float], str],
+    solve_ts: Callable[[str], str],
     log: Callable[[str], None] | None = None,
 ) -> dict:
+    """HAR auth trio through Patchright Chromium. Returns email/profile/sso. No Camoufox."""
     from patchright.sync_api import sync_playwright
 
-    from grok2api_import import import_build_sso
-    from grok_onboard import onboard_new_account
-    from guard_check import classify, register_check, should_retry_guard
-    from outlook_min import apply_live_otp, wait_for_code
-    from signup_protocol import make_protocol_session
-    from turnstile_capsolver import solve_turnstile
+    from outlook_min import apply_live_otp
 
     emit = log or (lambda _msg: None)
     emit("engine=patchright camoufox=no")
-    email = account["email"]
     pw = _rand_password()
     given = random.choice(FIRST)
     family = random.choice(LAST)
     proxy_cfg = _proxy_for_patchright(proxy)
     user_dir = tempfile.mkdtemp(prefix="patchright-ctx-")
     headed = bool(os.environ.get("DISPLAY") or os.environ.get("PATCHRIGHT_HEADED"))
-    chrome = str(os.environ.get("PATCHRIGHT_CHROME") or "").strip()
+    chrome = _chrome_path()
+    sso = ""
     with sync_playwright() as playwright:
         launch_kw: dict[str, Any] = {
             "headless": not headed,
@@ -546,7 +562,7 @@ def run_patchright_one(
                     raise RuntimeError(f"send-code {st} {str(data)[:180]}")
             else:
                 raise RuntimeError("send-code not fired and castle missing")
-            code = str(account.get("otp") or "").strip() or wait_for_code(account, after_ts=sent_at)
+            code = wait_otp(sent_at)
             emit(f"otp len={len(code)}")
             verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
             st, data, _raw = _post(page, har, verify, sentry, emit)
@@ -561,12 +577,7 @@ def run_patchright_one(
                     st, data = 200, captured.get("verify_json") or {"page": True}
             if st >= 400 or st == 0:
                 raise RuntimeError(f"verify-email {st} {str(data)[:180]}")
-            ts_token = solve_turnstile(
-                capsolver_key,
-                website_url=SIGNUP_URL,
-                website_key=sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
-                api=capsolver_api,
-            )
+            ts_token = solve_ts(sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0")
             emit(f"turnstile len={len(ts_token)}")
             create = build_create_account(
                 email=email,
@@ -600,6 +611,63 @@ def run_patchright_one(
                     browser.close()
                 except Exception:
                     pass
+            shutil.rmtree(user_dir, ignore_errors=True)
+    if not sso:
+        raise RuntimeError("patchright signup returned no sso")
+    return {
+        "email": email,
+        "sso": sso,
+        "password": pw,
+        "given_name": given,
+        "family_name": family,
+        "engine": "patchright",
+        "camoufox": False,
+    }
+
+
+def run_patchright_one(
+    *,
+    har: Any,
+    proxy: str,
+    account: dict,
+    capsolver_key: str,
+    capsolver_api: str,
+    guard_url: str,
+    guard_token: str,
+    grok2api: dict | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    from grok2api_import import import_build_sso
+    from grok_onboard import onboard_new_account
+    from guard_check import classify, register_check, should_retry_guard
+    from outlook_min import wait_for_code
+    from signup_protocol import make_protocol_session
+    from turnstile_capsolver import solve_turnstile
+
+    emit = log or (lambda _msg: None)
+    email = account["email"]
+
+    def wait_otp(after_ts: float) -> str:
+        return str(account.get("otp") or "").strip() or wait_for_code(account, after_ts=after_ts)
+
+    def solve_ts(sitekey: str) -> str:
+        return solve_turnstile(
+            capsolver_key,
+            website_url=SIGNUP_URL,
+            website_key=sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
+            api=capsolver_api,
+        )
+
+    outcome = signup_with_patchright(
+        har=har,
+        proxy=proxy,
+        email=email,
+        wait_otp=wait_otp,
+        solve_ts=solve_ts,
+        log=emit,
+    )
+    sso = str(outcome.get("sso") or "")
+    email = str(outcome.get("email") or email)
 
     session = make_protocol_session(proxy_url=proxy)
     onboard = onboard_new_account(session, sso)
