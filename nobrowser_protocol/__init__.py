@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""No-Camoufox protocol signup adapters (curl_cffi and Playwright Chromium)."""
+"""No-Camoufox protocol signup adapters (curl_cffi and Patchright)."""
 from __future__ import annotations
 
-ENGINES = ("cffi", "playwright")
+ENGINES = ("cffi", "patchright")
 FORBIDDEN_CAMOUFOX = ("camoufox_adapter", "start_browser", "Camoufox")

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Playwright Chromium protocol adapter. Not Camoufox.
+"""Patchright protocol adapter. Not Camoufox.
 
 Uses the live page Castle/Sentry SDKs then posts the shipped HAR auth trio via
 in-page fetch (same as protocol_register_once, different browser).
@@ -56,7 +56,7 @@ def _rand_password() -> str:
     return "Aa1!" + "".join(random.choice(chars) for _ in range(10))
 
 
-def _proxy_for_playwright(proxy_url: str) -> dict | None:
+def _proxy_for_patchright(proxy_url: str) -> dict | None:
     raw = str(proxy_url or "").strip()
     if not raw:
         return None
@@ -122,7 +122,7 @@ def _post(page, har: Any, built: dict, sentry: dict, log: Callable[[str], None])
     return status, data, raw
 
 
-def run_playwright_one(
+def run_patchright_one(
     *,
     har: Any,
     proxy: str,
@@ -134,7 +134,7 @@ def run_playwright_one(
     grok2api: dict | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
 
     from grok2api_import import import_build_sso
     from grok_onboard import onboard_new_account
@@ -144,12 +144,12 @@ def run_playwright_one(
     from turnstile_capsolver import solve_turnstile
 
     emit = log or (lambda _msg: None)
-    emit("engine=playwright-chromium camoufox=no")
+    emit("engine=patchright camoufox=no")
     email = account["email"]
     pw = _rand_password()
     given = random.choice(FIRST)
     family = random.choice(LAST)
-    proxy_cfg = _proxy_for_playwright(proxy)
+    proxy_cfg = _proxy_for_patchright(proxy)
     with sync_playwright() as playwright:
         launch_kw: dict[str, Any] = {"headless": True}
         if proxy_cfg:
@@ -162,7 +162,7 @@ def run_playwright_one(
             page.wait_for_timeout(2500)
             castle = _mint_castle(page, email, emit)
             if not castle.get("token"):
-                raise RuntimeError(f"playwright castle SDK empty how={castle.get('how')}")
+                raise RuntimeError(f"patchright castle SDK empty how={castle.get('how')}")
             sentry = _sentry(page)
             emit(f"sentry how={sentry.get('how')}")
             try:
@@ -263,7 +263,7 @@ def run_playwright_one(
         time.sleep(12.0)
     return {
         "email": email,
-        "engine": "playwright-chromium",
+        "engine": "patchright",
         "camoufox": False,
         "sso": bool(sso),
         "g2a_imported": bool(imported),

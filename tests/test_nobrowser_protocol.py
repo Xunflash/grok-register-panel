@@ -91,11 +91,11 @@ def _imported_names(path: Path) -> set[str]:
     return names
 
 
-def test_no_camoufox_on_cffi_or_playwright_engines():
-    cffi = ROOT / "nobrowser_protocol" / "cffi_engine.py"
-    pw = ROOT / "nobrowser_protocol" / "playwright_engine.py"
+def test_page_engine_is_patchright_not_playwright_or_camoufox():
+    engine = ROOT / "nobrowser_protocol" / "patchright_engine.py"
     run = ROOT / "nobrowser_protocol" / "run_live.py"
-    for path in (cffi, pw, run):
+    cffi = ROOT / "nobrowser_protocol" / "cffi_engine.py"
+    for path in (cffi, engine, run):
         text = path.read_text(encoding="utf-8")
         assert "camoufox_adapter" not in text
         assert "from camoufox" not in text
@@ -105,17 +105,23 @@ def test_no_camoufox_on_cffi_or_playwright_engines():
         assert "camoufox_adapter" not in imported
         assert "camoufox" not in imported
         assert "browser_session" not in imported
-    pw_text = pw.read_text(encoding="utf-8")
-    assert "playwright.chromium.launch" in pw_text
-    assert "camoufox" not in pw_text.lower() or "camoufox=no" in pw_text
+    engine_text = engine.read_text(encoding="utf-8")
+    run_text = run.read_text(encoding="utf-8")
+    assert "from patchright.sync_api import sync_playwright" in engine_text
+    assert "from playwright.sync_api" not in engine_text
+    assert "import playwright" not in engine_text
+    assert "python -m playwright install" not in engine_text
+    assert "python -m playwright install" not in run_text
+    assert "from playwright.sync_api" not in run_text
+    assert "run_patchright_one" in run_text
     from nobrowser_protocol.cffi_engine import camoufox_imports
-    from nobrowser_protocol.playwright_engine import camoufox_imports as pw_camoufox
+    from nobrowser_protocol.patchright_engine import camoufox_imports as pr_camoufox
 
     assert camoufox_imports() == ()
-    assert pw_camoufox() == ()
+    assert pr_camoufox() == ()
 
 
 if __name__ == "__main__":
     test_shipped_builders_match_har_auth_name_contract()
-    test_no_camoufox_on_cffi_or_playwright_engines()
+    test_page_engine_is_patchright_not_playwright_or_camoufox()
     print("OK nobrowser protocol")

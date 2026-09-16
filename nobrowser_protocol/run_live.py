@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Live no-Camoufox protocol signup: curl_cffi (无浏览器) or Playwright Chromium."""
+"""Live no-Camoufox protocol signup: curl_cffi or Patchright Chromium."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from nobrowser_protocol.cffi_engine import run_cffi_one
-from nobrowser_protocol.playwright_engine import run_playwright_one
+from nobrowser_protocol.patchright_engine import run_patchright_one
 from signup_protocol import load_har
 
 
@@ -48,7 +48,7 @@ def default_har() -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", choices=("cffi", "playwright"), default="cffi")
+    parser.add_argument("--engine", choices=("cffi", "patchright"), default="patchright")
     parser.add_argument("--har", default=str(default_har()))
     parser.add_argument("--outlook", default="")
     parser.add_argument("--proxy", default="")
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     cap_key = str(cfg.get("capsolver_key") or os.environ.get("CAPSOLVER_KEY") or "")
     cap_api = str(cfg.get("capsolver_api") or "https://api.capsolver.com")
-    runner = run_cffi_one if args.engine == "cffi" else run_playwright_one
+    runner = run_cffi_one if args.engine == "cffi" else run_patchright_one
     log(f"engine={args.engine} har={har_path} outlook={outlook} n={min(args.count, len(accounts))}")
     last = {}
     for account in accounts[: max(1, args.count)]:
