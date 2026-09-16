@@ -40,6 +40,7 @@ tests=(
   tests/test_batch_chdir_import.py
   tests/test_batch_supervisor.py
   tests/test_orchestrator_policy.py
+  tests/test_nobrowser_protocol.py
 )
 
 for test_file in "${tests[@]}"; do
