@@ -122,6 +122,7 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "python -m playwright install" not in run_text
     assert "from playwright.sync_api" not in run_text
     assert "run_patchright_one" in run_text
+    assert 'cfg.get("guard_url")' in run_text
     from nobrowser_protocol.cffi_engine import camoufox_imports
     from nobrowser_protocol.patchright_engine import (
         _castle_from_capture_or_mint,

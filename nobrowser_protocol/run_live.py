@@ -72,8 +72,20 @@ def main(argv: list[str] | None = None) -> int:
     if not accounts:
         raise SystemExit(f"no outlook accounts in {outlook}")
     proxy = str(args.proxy or cfg.get("proxy") or "").strip()
-    guard_url = str(args.guard_url or os.environ.get("GUARD_URL") or "http://127.0.0.1:8788")
-    guard_token = str(args.guard_token or os.environ.get("GUARD_TOKEN") or "")
+    guard_url = str(
+        args.guard_url
+        or os.environ.get("GUARD_URL")
+        or cfg.get("guard_url")
+        or cfg.get("risk_guard_url")
+        or "http://127.0.0.1:8788"
+    )
+    guard_token = str(
+        args.guard_token
+        or os.environ.get("GUARD_TOKEN")
+        or os.environ.get("GUARD_CONTROL_TOKEN")
+        or cfg.get("guard_token")
+        or ""
+    )
     grok2api = {
         "url": str(cfg.get("grok2api_remote_url") or ""),
         "username": str(cfg.get("grok2api_remote_username") or ""),
