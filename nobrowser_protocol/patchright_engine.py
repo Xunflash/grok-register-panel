@@ -29,6 +29,8 @@ from nobrowser_protocol.page_sdk import (  # noqa: E402
     CLICK_VISIBLE_JS,
     DUMP_PAGE_JS,
     FILL_EMAIL_JS,
+    FILL_OTP_JS,
+    OTP_VISIBLE_JS,
     PAGE_POST_JS,
     SENTRY_JS,
     SITEKEY_JS,
@@ -171,6 +173,10 @@ def _open_email_form(page, log: Callable[[str], None]) -> None:
 
 def _capture_auth_headers(captured: dict[str, Any], request) -> None:
     url = str(request.url or "")
+    method = str(request.method or "").upper()
+    if "accounts.x.ai" not in url and "/api/auth/" not in url:
+        return
+    captured.setdefault("auth_urls", []).append(f"{method} {url}")
     if "/api/auth/" not in url:
         return
     headers = request.headers or {}
@@ -180,7 +186,7 @@ def _capture_auth_headers(captured: dict[str, Any], request) -> None:
         captured["sentry_trace"] = sentry_trace
         captured["baggage"] = baggage
         captured["sentry_how"] = "page_request_headers"
-    if AUTH_SEND_CODE not in url or str(request.method or "").upper() != "POST":
+    if method != "POST":
         return
     try:
         body = request.post_data_json
@@ -192,8 +198,78 @@ def _capture_auth_headers(captured: dict[str, Any], request) -> None:
             body = json.loads(raw) if raw else {}
         except Exception:
             body = {}
-    captured["json"] = body
-    captured["url"] = url
+    if not isinstance(body, dict):
+        body = {}
+    captured.setdefault("posts", []).append({"url": url, "keys": list(body)})
+    token = str(body.get("castleRequestToken") or "").strip()
+    if token:
+        captured["token"] = token
+        captured["json"] = body
+        captured["url"] = url
+        captured["how"] = "page_send_code_request"
+    if AUTH_SEND_CODE in url:
+        captured["json"] = body or captured.get("json") or {}
+        captured["url"] = url
+    if AUTH_VERIFY_EMAIL in url:
+        captured["verify_json"] = body
+    if AUTH_CREATE_ACCOUNT in url:
+        captured["create_json"] = body
+
+
+def _otp_visible(page) -> bool:
+    try:
+        return bool(page.evaluate(OTP_VISIBLE_JS))
+    except Exception:
+        return False
+
+
+def _send_code_succeeded(captured: dict | None, otp_visible: bool = False) -> bool:
+    cap = captured or {}
+    if str(cap.get("token") or "").strip():
+        return True
+    body = cap.get("json") or {}
+    if isinstance(body, dict) and (body.get("email") or body.get("castleRequestToken")):
+        return True
+    how = str(cap.get("how") or "")
+    if how in {"page_send_code_request", "page_otp_form"}:
+        return True
+    return bool(otp_visible)
+
+
+def _fill_otp_and_confirm(page, code: str, log: Callable[[str], None]) -> str:
+    live = str(code or "").strip()
+    digits = "".join(ch for ch in live if ch.isalnum())
+    filled = ""
+    for value in (live, digits):
+        if not value:
+            continue
+        try:
+            loc = page.locator(
+                'input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp]'
+            ).first
+            loc.wait_for(state="visible", timeout=8000)
+            loc.fill(value, timeout=5000)
+            filled = value
+            break
+        except Exception as exc:
+            log(f"otp locator fill: {exc}")
+    if not filled:
+        try:
+            react = page.evaluate(FILL_OTP_JS, live or digits)
+            log(f"otp react fill={react!r}")
+            filled = live or digits
+        except Exception as exc:
+            log(f"otp react fill: {exc}")
+    clicked = _click_first(
+        page,
+        ("Confirm email", "Confirm", "Verify", "Continue", "确认", "验证"),
+        timeout=5000,
+        deny=("with email", "privacy", "resend"),
+    )
+    if not clicked:
+        clicked = str(page.evaluate(SUBMIT_EMAIL_JS) or "js-submit")
+    log(f"otp submit click={clicked!r} filled={bool(filled)}")
+    return clicked
 
 
 def _castle_from_capture_or_mint(captured: dict | None, minted: dict | None) -> dict:
@@ -214,9 +290,15 @@ def _castle_from_capture_or_mint(captured: dict | None, minted: dict | None) -> 
     }
 
 
-def _capture_send_code(page, email: str, log: Callable[[str], None], timeout: float = 45.0) -> dict:
+def _capture_send_code(
+    page,
+    email: str,
+    log: Callable[[str], None],
+    timeout: float = 45.0,
+    captured: dict[str, Any] | None = None,
+) -> dict:
     """Let the live page SDK fire send-code; capture castleRequestToken from that XHR."""
-    captured: dict[str, Any] = {}
+    captured = captured if captured is not None else {}
 
     def on_request(request):
         _capture_auth_headers(captured, request)
@@ -255,28 +337,32 @@ def _capture_send_code(page, email: str, log: Callable[[str], None], timeout: fl
         log(f"page fill/submit: {exc}")
         _dump_page(page, log, "fill-submit-fail")
     deadline = time.time() + timeout
+    otp_since = None
     while time.time() < deadline:
-        token = str(((captured.get("json") or {}).get("castleRequestToken")) or "").strip()
+        token = str(
+            captured.get("token")
+            or ((captured.get("json") or {}).get("castleRequestToken"))
+            or ""
+        ).strip()
         if token:
+            captured["token"] = token
+            captured["how"] = captured.get("how") or "page_send_code_request"
             log(f"castle how=page_send_code_request len={len(token)}")
-            return {
-                "token": token,
-                "how": "page_send_code_request",
-                "json": captured.get("json"),
-                "sentry_trace": captured.get("sentry_trace") or "",
-                "baggage": captured.get("baggage") or "",
-                "sentry_how": captured.get("sentry_how") or "",
-            }
+            return captured
+        if _otp_visible(page):
+            if otp_since is None:
+                otp_since = time.time()
+                log("OTP form visible; wait briefly for send-code XHR")
+            elif time.time() - otp_since >= 3.0:
+                captured["how"] = "page_otp_form"
+                log(f"send-code inferred from OTP form auth_urls={captured.get('auth_urls')!r}"[:400])
+                return captured
         time.sleep(0.4)
     _dump_page(page, log, "send-code-timeout")
-    return {
-        "token": "",
-        "how": "page_send_code_timeout",
-        "json": captured.get("json") or {},
-        "sentry_trace": captured.get("sentry_trace") or "",
-        "baggage": captured.get("baggage") or "",
-        "sentry_how": captured.get("sentry_how") or "",
-    }
+    captured["how"] = captured.get("how") or "page_send_code_timeout"
+    captured.setdefault("token", "")
+    captured.setdefault("json", {})
+    return captured
 
 
 def _mint_castle(page, email: str, log: Callable[[str], None], timeout: float = 45.0) -> dict:
@@ -388,6 +474,18 @@ def run_patchright_one(
             launch_kw["executable_path"] = chrome
         context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
         browser = context.browser
+        net: dict[str, Any] = {}
+
+        def on_request(request):
+            _capture_auth_headers(net, request)
+            url = str(request.url or "")
+            if "/api/auth/" in url:
+                emit(
+                    f"net {request.method} {url} "
+                    f"keys={list((net.get('json') or net.get('verify_json') or net.get('create_json') or {}))[:8]}"
+                )
+
+        context.on("request", on_request)
         try:
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
@@ -402,22 +500,28 @@ def run_patchright_one(
             # Patchright isolates Runtime.enable, so window.Castle is often
             # invisible to evaluate. Prefer the live page XHR as Castle source.
             emit("capture live send-code XHR from page submit")
-            captured = _capture_send_code(page, email, emit, timeout=45.0)
+            sent_at = time.time()
+            captured = _capture_send_code(
+                page, email, emit, timeout=45.0, captured=net
+            )
+            sent_via_page = _send_code_succeeded(captured, otp_visible=_otp_visible(page))
             minted = {}
-            sent_via_page = bool(str(captured.get("token") or "").strip())
-            if not sent_via_page:
+            if not captured.get("token") and not sent_via_page:
                 emit("page XHR empty; try Castle SDK evaluate")
                 minted = _mint_castle(page, email, emit, timeout=8.0)
             castle = _castle_from_capture_or_mint(captured, minted)
-            if not castle.get("token"):
+            if not castle.get("token") and not sent_via_page:
                 title = ""
                 try:
                     title = page.title()
                 except Exception:
                     title = ""
                 raise RuntimeError(
-                    f"patchright castle SDK empty how={castle.get('how')} title={title!r} url={page.url}"
+                    f"patchright castle SDK empty how={castle.get('how')} "
+                    f"title={title!r} url={page.url} auth={captured.get('auth_urls')!r}"[:500]
                 )
+            if sent_via_page and not castle.get("token"):
+                emit("send-code succeeded on page without captured castle; continue")
             sentry = _sentry(page)
             if captured.get("sentry_trace"):
                 sentry = {
@@ -425,23 +529,23 @@ def run_patchright_one(
                     "baggage": captured.get("baggage") or "",
                     "how": captured.get("sentry_how") or "page_request_headers",
                 }
-            emit(f"sentry how={sentry.get('how')}")
+            emit(f"sentry how={sentry.get('how')} castle_how={castle.get('how')}")
             try:
                 sitekey = str(page.evaluate(SITEKEY_JS) or "").strip()
             except Exception:
                 sitekey = ""
-            send = build_send_verification_code(
-                email=email, castle_request_token=castle["token"]
-            )
-            assert_send_code_has_castle(send)
-            sent_at = time.time()
             if sent_via_page:
                 emit("send-code already fired by live page SDK")
-                st, data = 200, {"captured": True}
-            else:
+            elif castle.get("token"):
+                send = build_send_verification_code(
+                    email=email, castle_request_token=castle["token"]
+                )
+                assert_send_code_has_castle(send)
                 st, data, _raw = _post(page, har, send, sentry, emit)
                 if st >= 400 or st == 0:
                     raise RuntimeError(f"send-code {st} {str(data)[:180]}")
+            else:
+                raise RuntimeError("send-code not fired and castle missing")
             code = str(account.get("otp") or "").strip() or wait_for_code(account, after_ts=sent_at)
             emit(f"otp len={len(code)}")
             verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
@@ -449,6 +553,12 @@ def run_patchright_one(
             if (st >= 400 or st == 0) and "-" in code:
                 verify = build_verify_email(email=email, code=code)
                 st, data, _raw = _post(page, har, verify, sentry, emit)
+            if st >= 400 or st == 0:
+                emit(f"HAR verify-email {st}; fill OTP on live page")
+                _fill_otp_and_confirm(page, code, emit)
+                page.wait_for_timeout(1500)
+                if captured.get("verify_json") or not _otp_visible(page):
+                    st, data = 200, captured.get("verify_json") or {"page": True}
             if st >= 400 or st == 0:
                 raise RuntimeError(f"verify-email {st} {str(data)[:180]}")
             ts_token = solve_turnstile(

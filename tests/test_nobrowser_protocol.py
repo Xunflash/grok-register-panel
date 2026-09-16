@@ -114,9 +114,13 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "page_send_code_request" in engine_text
     assert "page_request_headers" in engine_text
     assert "_castle_from_capture_or_mint" in engine_text
+    assert "_send_code_succeeded" in engine_text
+    assert "page_otp_form" in engine_text
+    assert "Confirm email" in engine_text
     assert "with apple" in engine_text
     assert "CLICK_VISIBLE_JS" in sdk_text
     assert "SUBMIT_EMAIL_JS" in sdk_text
+    assert "FILL_OTP_JS" in sdk_text
     assert "import playwright" not in engine_text
     assert "python -m playwright install" not in engine_text
     assert "python -m playwright install" not in run_text
@@ -126,6 +130,7 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     from nobrowser_protocol.cffi_engine import camoufox_imports
     from nobrowser_protocol.patchright_engine import (
         _castle_from_capture_or_mint,
+        _send_code_succeeded,
         camoufox_imports as pr_camoufox,
     )
 
@@ -145,6 +150,10 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert minted["how"] == "Castle.createRequestToken"
     empty = _castle_from_capture_or_mint({}, {})
     assert empty["token"] == ""
+    assert _send_code_succeeded({"token": "x"}) is True
+    assert _send_code_succeeded({"how": "page_otp_form"}) is True
+    assert _send_code_succeeded({}, otp_visible=True) is True
+    assert _send_code_succeeded({"how": "page_send_code_timeout"}, otp_visible=False) is False
 
 
 if __name__ == "__main__":

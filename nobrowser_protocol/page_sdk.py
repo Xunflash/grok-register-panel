@@ -206,6 +206,33 @@ SUBMIT_EMAIL_JS = """
 }
 """
 
+FILL_OTP_JS = """
+(code) => {
+  const input = document.querySelector('input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp], input[inputmode="numeric"]');
+  if (!input) return { ok: false, reason: 'no-input' };
+  input.focus();
+  input.click();
+  const proto = HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
+  const tracker = input._valueTracker;
+  if (tracker) tracker.setValue('');
+  if (setter) setter.call(input, code); else input.value = code;
+  input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: code, inputType: 'insertText' }));
+  input.dispatchEvent(new InputEvent('input', { bubbles: true, data: code, inputType: 'insertText' }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: !!(input.value), value: String(input.value || ''), name: input.getAttribute('name') || '' };
+}
+"""
+
+OTP_VISIBLE_JS = """
+() => {
+  const n = document.querySelector('input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp]');
+  if (!n) return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+"""
+
 DUMP_PAGE_JS = """
 () => {
   const vis = (n) => {
