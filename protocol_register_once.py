@@ -75,8 +75,10 @@ from browser_session import (  # noqa: E402
     try_rotate_proxy,
 )
 from retry_policy import (  # noqa: E402
+    ProtocolResourceUsage,
     ReusableResourceError,
     protocol_pre_inbox_retries,
+    retry_protocol_pre_inbox,
 )
 from register_flow import (  # noqa: E402
     _native_click_action,
@@ -118,16 +120,6 @@ HAR_PATH = ROOT / "log" / "signup-protocol-full.har"
 SURFACE_PATH = ROOT / "log" / "protocol-live-request-surface.json"
 
 
-class ProtocolResourceUsage:
-    """Track whether a protocol attempt spent mailbox or remote captcha."""
-
-    __slots__ = ("email_used", "remote_captcha_used")
-
-    def __init__(self) -> None:
-        self.email_used = False
-        self.remote_captcha_used = False
-
-
 def recycle_protocol_browser(log_callback=None) -> None:
     """Reopen Camoufox and switch exit if the worker registered a rotate hook."""
     emit = log_callback or log
@@ -137,39 +129,6 @@ def recycle_protocol_browser(log_callback=None) -> None:
     emit("[*] 协议预检：重开浏览器")
     restart_browser(log_callback=emit)
 
-
-def retry_protocol_pre_inbox(
-    run_once,
-    *,
-    recycle,
-    attempts: int,
-    log_fn,
-    cancel=None,
-    usage_factory=ProtocolResourceUsage,
-):
-    """Retry `run_once` while mailbox and remote captcha are still unused."""
-    last_exc: Exception | None = None
-    total = max(1, int(attempts or 1))
-    for attempt in range(1, total + 1):
-        if callable(cancel):
-            cancel()
-        usage = usage_factory()
-        try:
-            return run_once(usage)
-        except RegistrationCancelled:
-            raise
-        except Exception as exc:
-            if getattr(usage, "email_used", False) or getattr(
-                usage, "remote_captcha_used", False
-            ):
-                raise
-            last_exc = exc
-            log_fn(f"[!] 协议收件前失败 {attempt}/{total}: {exc}")
-            if attempt < total and callable(recycle):
-                recycle()
-                continue
-            raise ReusableResourceError(str(exc)) from exc
-    raise ReusableResourceError(str(last_exc or "protocol pre-inbox failed"))
 
 CASTLE_JS = """
 async () => {

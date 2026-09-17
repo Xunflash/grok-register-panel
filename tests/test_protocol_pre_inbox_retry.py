@@ -7,9 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from retry_policy import ReusableResourceError
-from protocol_register_once import (
+from retry_policy import (
     ProtocolResourceUsage,
+    ReusableResourceError,
     retry_protocol_pre_inbox,
 )
 

@@ -22,6 +22,7 @@ tests=(
   tests/test_static_asset_cache.py
   tests/test_batch_traffic.py
   tests/test_retry_policy.py
+  tests/test_protocol_pre_inbox_retry.py
   tests/test_success_stop.py
   tests/test_monitor_http.py
   tests/test_status_snapshot.py

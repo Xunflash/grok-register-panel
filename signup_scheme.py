@@ -138,12 +138,45 @@ def retry_patchright_mailboxes(
     raise RuntimeError(f"existingEmail after mailbox retries last={last_existing}")
 
 
+def recycle_patchright_exit(log_fn: Callable[[str], Any]) -> None:
+    """Switch exit for an unspent Patchright retry. Do not start Camoufox."""
+    try:
+        from browser_session import try_rotate_proxy
+
+        rotated = try_rotate_proxy("patchright pre-inbox retry", log_fn)
+        if rotated:
+            log_fn("[*] 协议预检：已换出口")
+    except Exception as exc:
+        log_fn(f"[!] patchright 换出口失败: {exc}")
+
+
+def run_patchright_pre_inbox(
+    run_once,
+    *,
+    recycle,
+    log_fn,
+    cancel=None,
+    attempts: int | None = None,
+):
+    """Same pre-inbox retry as 协议注册: unspent errors are ReusableResourceError."""
+    from retry_policy import protocol_pre_inbox_retries, retry_protocol_pre_inbox
+
+    return retry_protocol_pre_inbox(
+        run_once,
+        recycle=recycle,
+        attempts=protocol_pre_inbox_retries() if attempts is None else attempts,
+        log_fn=log_fn,
+        cancel=cancel,
+    )
+
+
 def _run_patchright_signup(
     log_callback: Optional[Callable[[str], Any]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Panel worker entry: panel mailbox/proxy/Turnstile + Patchright HAR trio."""
     from browser_session import get_bound_proxy
+    from email_providers.outlook_rt import release_reservation
     from grok_register_ttk import get_email_and_token, get_oai_code, mark_outlook_rt_used
     from nobrowser_protocol.patchright_engine import SIGNUP_URL, signup_with_patchright
     from signup_protocol import load_har
@@ -153,10 +186,11 @@ def _run_patchright_signup(
 
     def _cancel() -> None:
         if callable(cancel_callback) and cancel_callback():
-            raise RuntimeError("stopped")
+            from grok_register_ttk import RegistrationCancelled
+
+            raise RegistrationCancelled("stopped")
 
     _cancel()
-    proxy = get_bound_proxy()
     har_path = None
     root = Path(__file__).resolve().parent
     for candidate in (
@@ -171,44 +205,67 @@ def _run_patchright_signup(
         raise RuntimeError("protocol HAR missing for patchright signup")
     har = load_har(har_path)
 
-    def signup(email: str, mail_token: str) -> dict:
-        def wait_otp(_after_ts: float, _email=email, _token=mail_token) -> str:
-            _cancel()
-            return get_oai_code(
-                _token,
-                _email,
-                log_callback=emit,
-                cancel_callback=cancel_callback,
-            )
+    def _once(usage) -> dict:
+        proxy = get_bound_proxy()
 
-        def solve_ts(sitekey: str) -> str:
-            _cancel()
-            return panel_solve_turnstile(
-                SIGNUP_URL,
-                sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
-                log=emit,
-                cancel=_cancel,
-            )
+        def signup(email: str, mail_token: str) -> dict:
+            def wait_otp(_after_ts: float, _email=email, _token=mail_token) -> str:
+                _cancel()
+                return get_oai_code(
+                    _token,
+                    _email,
+                    log_callback=emit,
+                    cancel_callback=cancel_callback,
+                )
 
-        return signup_with_patchright(
-            har=har,
-            proxy=proxy,
-            email=email,
-            wait_otp=wait_otp,
-            solve_ts=solve_ts,
+            def solve_ts(sitekey: str) -> str:
+                _cancel()
+                return panel_solve_turnstile(
+                    SIGNUP_URL,
+                    sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
+                    log=emit,
+                    cancel=_cancel,
+                )
+
+            try:
+                return signup_with_patchright(
+                    har=har,
+                    proxy=proxy,
+                    email=email,
+                    wait_otp=wait_otp,
+                    solve_ts=solve_ts,
+                    log=emit,
+                    usage=usage,
+                )
+            except Exception:
+                if not getattr(usage, "email_used", False) and not getattr(
+                    usage, "remote_captcha_used", False
+                ):
+                    try:
+                        release_reservation(mail_token, email)
+                    except Exception:
+                        pass
+                raise
+
+        def mark_used(email: str) -> None:
+            if usage is not None:
+                usage.email_used = True
+            mark_outlook_rt_used(email, reason="existing_email", log_callback=emit)
+
+        return retry_patchright_mailboxes(
+            take_mailbox=get_email_and_token,
+            signup=signup,
+            mark_used=mark_used,
             log=emit,
+            cancel=_cancel,
+            max_tries=3,
         )
 
-    def mark_used(email: str) -> None:
-        mark_outlook_rt_used(email, reason="existing_email", log_callback=emit)
-
-    outcome = retry_patchright_mailboxes(
-        take_mailbox=get_email_and_token,
-        signup=signup,
-        mark_used=mark_used,
-        log=emit,
+    outcome = run_patchright_pre_inbox(
+        _once,
+        recycle=lambda: recycle_patchright_exit(emit),
+        log_fn=emit,
         cancel=_cancel,
-        max_tries=3,
     )
     return {
         "email": outcome["email"],

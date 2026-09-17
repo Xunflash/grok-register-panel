@@ -412,6 +412,90 @@ def test_patchright_panel_retries_existing_email_and_marks_used():
     ).read_text(encoding="utf-8")
 
 
+def test_patchright_pre_inbox_retries_unspent_then_counts_spent():
+    from retry_policy import ReusableResourceError, should_count_as_failure
+    from signup_scheme import run_patchright_pre_inbox
+
+    calls = {"n": 0, "recycle": 0}
+    logs = []
+
+    def run_once(_usage):
+        calls["n"] += 1
+        raise RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    def recycle():
+        calls["recycle"] += 1
+
+    try:
+        run_patchright_pre_inbox(
+            run_once,
+            recycle=recycle,
+            log_fn=logs.append,
+            attempts=3,
+        )
+    except ReusableResourceError as exc:
+        assert "ERR_TUNNEL_CONNECTION_FAILED" in str(exc)
+        assert should_count_as_failure(exc) is False
+    else:
+        raise AssertionError("unspent tunnel error must be ReusableResourceError")
+    assert calls["n"] == 3
+    assert calls["recycle"] == 2
+    assert any("收件前失败" in line for line in logs)
+
+    spent_calls = {"n": 0, "recycle": 0}
+
+    def run_spent(usage):
+        spent_calls["n"] += 1
+        usage.email_used = True
+        raise RuntimeError("no sso keys=['existingEmail', 'signInMethods']")
+
+    try:
+        run_patchright_pre_inbox(
+            run_spent,
+            recycle=lambda: spent_calls.__setitem__("recycle", spent_calls["recycle"] + 1),
+            log_fn=lambda _m: None,
+            attempts=3,
+        )
+    except RuntimeError as exc:
+        assert "existingEmail" in str(exc)
+        assert should_count_as_failure(exc) is True
+    else:
+        raise AssertionError("spent mailbox error must count as failure")
+    assert spent_calls["n"] == 1
+    assert spent_calls["recycle"] == 0
+
+    cap_calls = {"n": 0}
+
+    def run_cap(usage):
+        cap_calls["n"] += 1
+        usage.remote_captcha_used = True
+        raise RuntimeError("400 Client Error: Bad Request for url: https://api.capsolver.com/getTaskResult")
+
+    try:
+        run_patchright_pre_inbox(
+            run_cap,
+            recycle=lambda: None,
+            log_fn=lambda _m: None,
+            attempts=4,
+        )
+    except RuntimeError as exc:
+        assert "capsolver" in str(exc).lower()
+        assert should_count_as_failure(exc) is True
+    else:
+        raise AssertionError("spent captcha error must count as failure")
+    assert cap_calls["n"] == 1
+
+    engine = (ROOT / "nobrowser_protocol" / "patchright_engine.py").read_text(
+        encoding="utf-8"
+    )
+    scheme = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
+    assert "usage.email_used = True" in engine
+    assert "usage.remote_captcha_used = True" in engine
+    assert "run_patchright_pre_inbox" in scheme
+    assert "recycle_patchright_exit" in scheme
+    assert "restart_browser" not in scheme.split("def recycle_patchright_exit")[1].split("def ")[0]
+
+
 def test_panel_worker_loads_patchright_otp_without_outlook_min():
     """Panel release tree has no cffi_har_signup; worker must not need outlook_min."""
     import importlib
@@ -447,5 +531,6 @@ if __name__ == "__main__":
     test_signup_with_patchright_survives_running_asyncio_loop()
     test_existing_email_payload_and_engine_raises()
     test_patchright_panel_retries_existing_email_and_marks_used()
+    test_patchright_pre_inbox_retries_unspent_then_counts_spent()
     test_panel_worker_loads_patchright_otp_without_outlook_min()
     print("OK nobrowser protocol")

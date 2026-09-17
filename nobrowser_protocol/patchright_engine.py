@@ -520,6 +520,7 @@ def signup_with_patchright(
     wait_otp: Callable[[float], str],
     solve_ts: Callable[[str], str],
     log: Callable[[str], None] | None = None,
+    usage: Any = None,
 ) -> dict:
     """HAR auth trio through Patchright Chromium. Returns email/profile/sso. No Camoufox."""
     emit = log or (lambda _msg: None)
@@ -533,6 +534,7 @@ def signup_with_patchright(
                 wait_otp=wait_otp,
                 solve_ts=solve_ts,
                 log=log,
+                usage=usage,
             )
         )
     from patchright.sync_api import sync_playwright
@@ -589,6 +591,8 @@ def signup_with_patchright(
                 page, email, emit, timeout=45.0, captured=net
             )
             sent_via_page = _send_code_succeeded(captured, otp_visible=_otp_visible(page))
+            if sent_via_page and usage is not None:
+                usage.email_used = True
             minted = {}
             if not captured.get("token") and not sent_via_page:
                 emit("page XHR empty; try Castle SDK evaluate")
@@ -625,11 +629,15 @@ def signup_with_patchright(
                     email=email, castle_request_token=castle["token"]
                 )
                 assert_send_code_has_castle(send)
+                if usage is not None:
+                    usage.email_used = True
                 st, data, _raw = _post(page, har, send, sentry, emit)
                 if st >= 400 or st == 0:
                     raise RuntimeError(f"send-code {st} {str(data)[:180]}")
             else:
                 raise RuntimeError("send-code not fired and castle missing")
+            if usage is not None:
+                usage.email_used = True
             code = wait_otp(sent_at)
             emit(f"otp len={len(code)}")
             verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
@@ -645,6 +653,8 @@ def signup_with_patchright(
                     st, data = 200, captured.get("verify_json") or {"page": True}
             if st >= 400 or st == 0:
                 raise RuntimeError(f"verify-email {st} {str(data)[:180]}")
+            if usage is not None:
+                usage.remote_captcha_used = True
             ts_token = solve_ts(sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0")
             emit(f"turnstile len={len(ts_token)}")
             create = build_create_account(

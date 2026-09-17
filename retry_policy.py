@@ -15,6 +15,16 @@ PROTOCOL_PRE_INBOX_RETRIES_DEFAULT = 3
 PRECHECK_EXIT_CODE = 78
 
 
+class ProtocolResourceUsage:
+    """Track whether a protocol/Patchright attempt spent mailbox or remote captcha."""
+
+    __slots__ = ("email_used", "remote_captcha_used")
+
+    def __init__(self) -> None:
+        self.email_used = False
+        self.remote_captcha_used = False
+
+
 class ReusableResourceError(Exception):
     """Pre-inbox failure that did not consume mailbox or remote captcha.
 
@@ -32,6 +42,40 @@ class ReusableResourceError(Exception):
         super().__init__(message)
         self.email_used = bool(email_used)
         self.remote_captcha_used = bool(remote_captcha_used)
+
+
+def retry_protocol_pre_inbox(
+    run_once,
+    *,
+    recycle,
+    attempts: int,
+    log_fn,
+    cancel=None,
+    usage_factory=ProtocolResourceUsage,
+):
+    """Retry `run_once` while mailbox and remote captcha are still unused."""
+    last_exc: Exception | None = None
+    total = max(1, int(attempts or 1))
+    for attempt in range(1, total + 1):
+        if callable(cancel):
+            cancel()
+        usage = usage_factory()
+        try:
+            return run_once(usage)
+        except Exception as exc:
+            if exc.__class__.__name__ == "RegistrationCancelled":
+                raise
+            if getattr(usage, "email_used", False) or getattr(
+                usage, "remote_captcha_used", False
+            ):
+                raise
+            last_exc = exc
+            log_fn(f"[!] 协议收件前失败 {attempt}/{total}: {exc}")
+            if attempt < total and callable(recycle):
+                recycle()
+                continue
+            raise ReusableResourceError(str(exc)) from exc
+    raise ReusableResourceError(str(last_exc or "protocol pre-inbox failed"))
 
 
 def should_count_as_failure(exc: BaseException | None) -> bool:
