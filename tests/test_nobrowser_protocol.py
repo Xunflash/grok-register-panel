@@ -340,6 +340,78 @@ def test_signup_with_patchright_survives_running_asyncio_loop():
         assert errors and "patchright" in errors[0].lower()
 
 
+def test_existing_email_payload_and_engine_raises():
+    from nobrowser_protocol.patchright_engine import (
+        ExistingEmailError,
+        existing_email_payload,
+    )
+
+    assert existing_email_payload(
+        {"existingEmail": "old@outlook.com", "signInMethods": ["password"]}
+    )
+    assert existing_email_payload({"signInMethods": ["google"]})
+    assert not existing_email_payload({"session": "sso-token-value-long-enough"})
+    assert not existing_email_payload("nope")
+    engine = (ROOT / "nobrowser_protocol" / "patchright_engine.py").read_text(
+        encoding="utf-8"
+    )
+    scheme = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
+    ttk = (ROOT / "grok_register_ttk.py").read_text(encoding="utf-8")
+    assert "raise ExistingEmailError" in engine
+    assert "existing_email" in scheme
+    assert "retry_patchright_mailboxes" in scheme
+    assert "mark_outlook_rt_used" in scheme
+    assert "def mark_outlook_rt_used(" in ttk
+    err = ExistingEmailError("a@b.c", {"existingEmail": True, "signInMethods": ["p"]})
+    assert err.email == "a@b.c"
+    assert "existingEmail=a@b.c" in str(err)
+
+
+def test_patchright_panel_retries_existing_email_and_marks_used():
+    from nobrowser_protocol.patchright_engine import ExistingEmailError
+    from signup_scheme import retry_patchright_mailboxes
+
+    calls = {"mail": 0, "marked": []}
+
+    def take_mailbox():
+        calls["mail"] += 1
+        return f"box{calls['mail']}@outlook.com", f"tok{calls['mail']}"
+
+    def signup(email, _token):
+        if email.startswith("box1") or email.startswith("box2"):
+            raise ExistingEmailError(
+                email, {"existingEmail": email, "signInMethods": ["password"]}
+            )
+        return {
+            "email": email,
+            "sso": "sso-from-third",
+            "password": "pw",
+            "given_name": "A",
+            "family_name": "B",
+        }
+
+    def mark_used(email):
+        calls["marked"].append(email)
+
+    logs = []
+    out = retry_patchright_mailboxes(
+        take_mailbox=take_mailbox,
+        signup=signup,
+        mark_used=mark_used,
+        log=logs.append,
+        cancel=lambda: None,
+        max_tries=3,
+    )
+    assert out["email"] == "box3@outlook.com"
+    assert out["sso"] == "sso-from-third"
+    assert calls["mail"] == 3
+    assert calls["marked"] == ["box1@outlook.com", "box2@outlook.com"]
+    assert any("existingEmail=box1@outlook.com" in line for line in logs)
+    assert "retry_patchright_mailboxes" in (
+        ROOT / "signup_scheme.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_panel_worker_loads_patchright_otp_without_outlook_min():
     """Panel release tree has no cffi_har_signup; worker must not need outlook_min."""
     import importlib
@@ -373,5 +445,7 @@ if __name__ == "__main__":
     test_page_engine_is_patchright_not_playwright_or_camoufox()
     test_signup_with_patchright_reaches_browser_without_outlook_min()
     test_signup_with_patchright_survives_running_asyncio_loop()
+    test_existing_email_payload_and_engine_raises()
+    test_patchright_panel_retries_existing_email_and_marks_used()
     test_panel_worker_loads_patchright_otp_without_outlook_min()
     print("OK nobrowser protocol")

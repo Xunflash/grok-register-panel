@@ -1313,7 +1313,8 @@ def _guard_register_check(email: str, log_callback=None) -> dict:
     return data if isinstance(data, dict) else {"risk": False}
 
 
-def _mark_outlook_used_for_guard(email: str, log_callback=None) -> None:
+def mark_outlook_rt_used(email: str, *, reason: str = "", log_callback=None) -> None:
+    """Record an Outlook RT mailbox as used. No-op for other email providers."""
     if str(config.get("email_provider") or "").strip() != "outlook_rt":
         return
     inv = get_outlook_rt_inventory()
@@ -1324,13 +1325,17 @@ def _mark_outlook_used_for_guard(email: str, log_callback=None) -> None:
             email,
             inv,
             get_outlook_rt_used_path(),
-            reason="guard_risk",
+            reason=reason,
         )
         if log_callback:
-            log_callback(f"[guard] Outlook 已标记 used: {email}")
+            log_callback(f"[*] Outlook 已标记 used ({reason or 'used'}): {email}")
     except Exception as exc:
         if log_callback:
-            log_callback(f"[guard] Outlook 标记 used 失败: {exc}")
+            log_callback(f"[!] Outlook 标记 used 失败: {exc}")
+
+
+def _mark_outlook_used_for_guard(email: str, log_callback=None) -> None:
+    mark_outlook_rt_used(email, reason="guard_risk", log_callback=log_callback)
 
 
 def _apply_guard_register_result(email: str, payload: dict, log_callback=None) -> None:

@@ -56,6 +56,27 @@ from signup_protocol import (  # noqa: E402
 )
 
 SIGNUP_URL = AUTH_ORIGIN + "/sign-up?redirect=grok-com"
+
+
+class ExistingEmailError(RuntimeError):
+    """create-account said this mailbox is already registered on x.ai."""
+
+    def __init__(self, email: str, payload: Any = None):
+        self.email = str(email or "").strip()
+        self.payload = payload if isinstance(payload, dict) else {}
+        super().__init__(f"existingEmail={self.email} keys={list(self.payload)[:8]}")
+
+
+def existing_email_payload(data: Any) -> bool:
+    """True when create-account returned an already-registered mailbox, not SSO."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("existingEmail"):
+        return True
+    methods = data.get("signInMethods")
+    if methods and not sso_from_create_payload(data):
+        return True
+    return False
 _T = TypeVar("_T")
 
 
@@ -646,6 +667,9 @@ def signup_with_patchright(
                         sso = str(cookie.get("value") or "")
                         if sso:
                             break
+            if not sso and existing_email_payload(data):
+                emit(f"existingEmail={email} keys={list(data)[:8]}")
+                raise ExistingEmailError(email, data)
             if not sso:
                 raise RuntimeError(
                     f"no sso keys={list(data)[:12] if isinstance(data, dict) else type(data)}"

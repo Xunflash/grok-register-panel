@@ -107,13 +107,44 @@ def _load_patchright_signup() -> Callable[..., dict]:
     return _run_patchright_signup
 
 
+def retry_patchright_mailboxes(
+    *,
+    take_mailbox: Callable[[], tuple[str, str]],
+    signup: Callable[[str, str], dict],
+    mark_used: Callable[[str], None],
+    log: Callable[[str], Any],
+    cancel: Callable[[], None],
+    max_tries: int = 3,
+) -> dict:
+    """Take a new mailbox when create-account reports existingEmail; mark used."""
+    from nobrowser_protocol.patchright_engine import ExistingEmailError
+
+    last_existing = ""
+    tries = max(1, int(max_tries or 3))
+    for mail_try in range(1, tries + 1):
+        cancel()
+        email, mail_token = take_mailbox()
+        log(f"[*] patchright mailbox {email} (try {mail_try}/{tries})")
+        try:
+            outcome = signup(email, mail_token)
+        except ExistingEmailError as exc:
+            last_existing = str(exc.email or email)
+            mark_used(last_existing)
+            log(f"[!] existingEmail={last_existing}, retry another mailbox")
+            continue
+        if not isinstance(outcome, dict) or not outcome.get("sso"):
+            raise RuntimeError("patchright signup returned no sso")
+        return outcome
+    raise RuntimeError(f"existingEmail after mailbox retries last={last_existing}")
+
+
 def _run_patchright_signup(
     log_callback: Optional[Callable[[str], Any]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Panel worker entry: panel mailbox/proxy/Turnstile + Patchright HAR trio."""
     from browser_session import get_bound_proxy
-    from grok_register_ttk import get_email_and_token, get_oai_code
+    from grok_register_ttk import get_email_and_token, get_oai_code, mark_outlook_rt_used
     from nobrowser_protocol.patchright_engine import SIGNUP_URL, signup_with_patchright
     from signup_protocol import load_har
     from turnstile_solver import solve_turnstile as panel_solve_turnstile
@@ -125,8 +156,6 @@ def _run_patchright_signup(
             raise RuntimeError("stopped")
 
     _cancel()
-    email, mail_token = get_email_and_token()
-    emit(f"[*] patchright mailbox {email}")
     proxy = get_bound_proxy()
     har_path = None
     root = Path(__file__).resolve().parent
@@ -142,31 +171,44 @@ def _run_patchright_signup(
         raise RuntimeError("protocol HAR missing for patchright signup")
     har = load_har(har_path)
 
-    def wait_otp(_after_ts: float) -> str:
-        _cancel()
-        return get_oai_code(
-            mail_token,
-            email,
-            log_callback=emit,
-            cancel_callback=cancel_callback,
-        )
+    def signup(email: str, mail_token: str) -> dict:
+        def wait_otp(_after_ts: float, _email=email, _token=mail_token) -> str:
+            _cancel()
+            return get_oai_code(
+                _token,
+                _email,
+                log_callback=emit,
+                cancel_callback=cancel_callback,
+            )
 
-    def solve_ts(sitekey: str) -> str:
-        _cancel()
-        return panel_solve_turnstile(
-            SIGNUP_URL,
-            sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
+        def solve_ts(sitekey: str) -> str:
+            _cancel()
+            return panel_solve_turnstile(
+                SIGNUP_URL,
+                sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0",
+                log=emit,
+                cancel=_cancel,
+            )
+
+        return signup_with_patchright(
+            har=har,
+            proxy=proxy,
+            email=email,
+            wait_otp=wait_otp,
+            solve_ts=solve_ts,
             log=emit,
-            cancel=_cancel,
         )
 
-    outcome = signup_with_patchright(
-        har=har,
-        proxy=proxy,
-        email=email,
-        wait_otp=wait_otp,
-        solve_ts=solve_ts,
+    def mark_used(email: str) -> None:
+        mark_outlook_rt_used(email, reason="existing_email", log_callback=emit)
+
+    outcome = retry_patchright_mailboxes(
+        take_mailbox=get_email_and_token,
+        signup=signup,
+        mark_used=mark_used,
         log=emit,
+        cancel=_cancel,
+        max_tries=3,
     )
     return {
         "email": outcome["email"],
