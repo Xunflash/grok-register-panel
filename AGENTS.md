@@ -1,5 +1,12 @@
 # AGENTS.md
 
+Current development baseline: `rollback/pre-resin-20260919`. See `BASELINE.json`
+for exact provenance and limitations. September 19/20 custom releases are
+superseded. Develop from this branch; do not restore later overlays or old
+watchdogs. Runtime data, credentials and production Compose are not Git
+rollback targets. The full pre-reset working trees and Git refs are backed
+up at `/home/xunflash/backups/grok-dev-rollback-20260920/`.
+
 This file is the working contract for AI coding agents in this repository. Keep
 changes narrow, preserve existing runtime behavior, and never use real operator
 credentials as fixtures or examples.

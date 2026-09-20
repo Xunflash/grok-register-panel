@@ -1,0 +1,8 @@
+{
+  "baseline": "2026-09-19T23:20:39+08:00 before Resin changes",
+  "image": null,
+  "source_parent": "089c7c5b42d00e7a5fe99939e5aedd8a3cc91045",
+  "backup_directory": "/home/xunflash/backups/grok-dev-rollback-20260920",
+  "branch": "rollback/pre-resin-20260919",
+  "verification": "Latest committed Git source before cutoff: 089c7c5. Exact pre-cutoff uncommitted Panel source is unavailable; production Panel was not changed."
+}
