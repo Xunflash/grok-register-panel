@@ -25,6 +25,7 @@ tests=(
   tests/test_protocol_pre_inbox_retry.py
   tests/test_success_stop.py
   tests/test_monitor_http.py
+  tests/test_guard_signup_policy.py
   tests/test_status_snapshot.py
   tests/test_status_v2_http.py
   tests/test_release_features.py

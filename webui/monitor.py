@@ -2237,6 +2237,16 @@ HTML = r"""<!DOCTYPE html>
           <option value="on">开启（保存 HAR）</option>
         </select>
       </div>
+      <div class="field">
+        <label for="signup-short-risk">新号短窗判风控</label>
+        <select id="signup-short-risk" disabled>
+          <option value="off">关闭</option>
+          <option value="on">开启：短窗计为一次失败</option>
+        </select>
+        <button type="button" onclick="saveSignupPolicy()" id="signup-short-save" disabled>保存新号检测策略</button>
+        <button type="button" onclick="refreshSignupPolicy()">读取新号检测策略</button>
+        <span id="signup-short-message" role="status">正在读取 Guard 策略</span>
+      </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()" disabled>启动任务</button>
         <button class="danger" id="btn-stop" onclick="doStop()" disabled>停止任务</button>
@@ -3028,6 +3038,30 @@ async function api(path, opts) {
   if (j && j.ok === false) throw new Error(j.error || j.message || "request failed");
   if (revalidate && r.headers.get("ETag")) responseCache.set(path, { tag: r.headers.get("ETag"), token: tok, data: j });
   return j;
+}
+async function refreshSignupPolicy() {
+  const select = document.getElementById("signup-short-risk");
+  const save = document.getElementById("signup-short-save");
+  const message = document.getElementById("signup-short-message");
+  select.disabled = save.disabled = true;
+  try {
+    const policy = await api("/api/guard/signup-policy");
+    select.value = policy.enabled ? "on" : "off";
+    message.textContent = `短窗阈值 ${policy.min_generation_ms}ms；最多三次 xhigh，一次合格即通过。保存后对新启动的检测生效。`;
+    select.disabled = save.disabled = false;
+  } catch (error) { message.textContent = "读取失败：" + error.message; }
+}
+async function saveSignupPolicy() {
+  const enabled = document.getElementById("signup-short-risk").value === "on";
+  document.getElementById("signup-short-save").disabled = true;
+  try {
+    await api("/api/guard/signup-policy", { method: "POST", body: JSON.stringify({ enabled }) });
+    await refreshSignupPolicy();
+    document.getElementById("signup-short-message").textContent += " 已保存。";
+  } catch (error) {
+    document.getElementById("signup-short-message").textContent = "保存失败：" + error.message;
+    document.getElementById("signup-short-save").disabled = false;
+  }
 }
 function proxyStatusLabel(status) {
   return ({ healthy: "健康", unhealthy: "异常", cooldown: "冷却", testing: "检测中", unknown: "未检测" })[status] || "未检测";
@@ -4189,6 +4223,7 @@ refreshRecovery();
 setInterval(refreshRecovery, 5000);
 refreshBfs();
 setInterval(refreshBfs, 15000);
+refreshSignupPolicy();
 refreshSsoState();
 setInterval(() => {
   if (document.body.classList.contains("sso-view-open") || (lastSsoState && lastSsoState.running)) {
@@ -4324,6 +4359,16 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/maintenance":
             if self._require_read():
                 self._maintenance_status()
+            return
+        if u.path == "/api/guard/signup-policy":
+            if not self._require_read():
+                return
+            try:
+                from webui.guard_signup_policy import signup_policy
+
+                self._json(200, signup_policy(_read_json(ROOT / "config.json", {}) or {}))
+            except Exception:
+                self._json(503, {"error": "Guard signup policy unavailable"})
             return
         if u.path == "/api/quarantines":
             if not self._require_read():
@@ -4485,6 +4530,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         except ValueError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/guard/signup-policy":
+            if type(body.get("enabled")) is not bool:
+                self._json(400, {"error": "enabled must be a boolean"})
+                return
+            try:
+                from webui.guard_signup_policy import signup_policy
+
+                self._json(200, signup_policy(_read_json(ROOT / "config.json", {}) or {}, body["enabled"]))
+            except Exception:
+                self._json(503, {"error": "Guard signup policy update failed"})
             return
         if u.path == "/api/control":
             try:
