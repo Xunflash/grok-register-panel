@@ -548,6 +548,11 @@ def test_outlook_code_miss_switches_mailbox_and_does_not_count():
     assert should_count_as_failure(switched) is False
     assert should_count_as_failure(limited) is False
     assert should_count_as_failure(changed) is False
+    interrupted = RuntimeError(
+        'Page.goto: Navigation to "https://accounts.x.ai/sign-up?redirect=grok-com" '
+        'is interrupted by another navigation to "chrome-error://chromewebdata/"'
+    )
+    assert should_count_as_failure(interrupted) is False
     assert should_count_as_failure(RuntimeError("send-code not accepted status=400")) is True
 
 

@@ -87,7 +87,11 @@ def is_mailbox_code_miss(exc: BaseException | None) -> bool:
 def is_unscored_attempt(exc: BaseException | None) -> bool:
     """Proxy bounce or an exhausted send-code switch. Keep going; do not score a failure."""
     msg = str(exc or "")
-    if "ERR_NETWORK_CHANGED" in msg:
+    if (
+        "ERR_NETWORK_CHANGED" in msg
+        or "chrome-error://chromewebdata" in msg
+        or "interrupted by another navigation" in msg
+    ):
         return True
     if "已换" not in msg:
         return False

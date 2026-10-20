@@ -719,16 +719,47 @@ def _wait_cookie_chain(page, log: Callable[[str], None], timeout: float = 40.0, 
     return url
 
 
+def _chrome_error_navigation(text: object) -> bool:
+    raw = str(text or "")
+    return "chrome-error://chromewebdata" in raw or "interrupted by another navigation" in raw
+
+
+def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
+    """Open the accounts sign-up page. A chrome-error interrupt is retried, not fatal."""
+    last = ""
+    for attempt in range(1, 4):
+        try:
+            page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            last = str(exc)
+            log(f"sign-up goto {attempt}/3: {exc}")
+            if not _chrome_error_navigation(exc) and attempt >= 3:
+                raise
+            page.wait_for_timeout(600)
+            continue
+        url = str(getattr(page, "url", "") or "")
+        if not _chrome_error_navigation(url):
+            return
+        last = url
+        log(f"sign-up landed on chrome-error {attempt}/3")
+        page.wait_for_timeout(600)
+    raise RuntimeError(
+        f'Page.goto: Navigation to "{SIGNUP_URL}" is interrupted by another navigation to "{last}"'
+    )
+
+
 def _open_signup_page(page, log: Callable[[str], None]) -> None:
     """Match the manual entry: grok.com/sign-up, then accounts sign-up, then cookie-chain."""
     try:
         page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
     except Exception as exc:
         log(f"grok.com/sign-up: {exc}")
-    page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+    _goto_accounts_signup(page, log)
     _wait_cookie_chain(page, log)
-    if "sign-up" not in str(getattr(page, "url", "") or ""):
-        page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+    if _chrome_error_navigation(getattr(page, "url", "")) or "sign-up" not in str(
+        getattr(page, "url", "") or ""
+    ):
+        _goto_accounts_signup(page, log)
         _wait_cookie_chain(page, log, grace=2.0)
 
 

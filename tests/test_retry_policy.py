@@ -46,6 +46,12 @@ def test_reusable_resource_error_is_not_counted_until_spent():
             "Page.goto: net::ERR_NETWORK_CHANGED at https://accounts.x.ai/sign-up?redirect=grok-com"
         )
     ) is False
+    assert retry_policy.should_count_as_failure(
+        RuntimeError(
+            'Page.goto: Navigation to "https://accounts.x.ai/sign-up?redirect=grok-com" '
+            'is interrupted by another navigation to "chrome-error://chromewebdata/"'
+        )
+    ) is False
     reset = ConnectionResetError(104, "Connection reset by peer")
     aborted = Exception("('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))")
     assert is_browser_pipe_error(reset) is True
