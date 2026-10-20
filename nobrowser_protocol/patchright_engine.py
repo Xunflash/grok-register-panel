@@ -440,9 +440,9 @@ def _capture_send_code(
                 return
             if str(getattr(response.request, "method", "") or "").upper() != "POST":
                 return
-            captured["send_status"] = int(response.status)
+            status = int(response.status)
             code = ""
-            if int(response.status) >= 400:
+            if status >= 400:
                 try:
                     data = response.json()
                 except Exception:
@@ -450,10 +450,11 @@ def _capture_send_code(
                 if isinstance(data, dict):
                     code = str(data.get("code") or data.get("error") or "")[:120]
                     captured["send_error"] = code
+            captured["send_status"] = status
             if code:
-                log(f"send-code response status={response.status} code={code}")
+                log(f"send-code response status={status} code={code}")
             else:
-                log(f"send-code response status={response.status}")
+                log(f"send-code response status={status}")
         except Exception as exc:
             log(f"send-code response read: {exc}")
 
