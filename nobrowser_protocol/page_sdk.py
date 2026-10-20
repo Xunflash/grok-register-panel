@@ -286,6 +286,107 @@ FILL_OTP_JS = """
 }
 """
 
+FILL_CONTROL_JS = """
+({ selector, value }) => {
+  const visible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    if (el.closest('[hidden]')) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const input = Array.from(document.querySelectorAll(selector || '')).find(visible);
+  if (!input) return { ok: false, reason: 'no-visible-control' };
+  const next = String(value || '');
+  input.focus();
+  const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+  const setter = desc && desc.set;
+  const write = (text) => {
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue(input.value);
+    if (setter) setter.call(input, text);
+    else input.value = text;
+  };
+  const reactKey = Object.keys(input).find((k) => k.startsWith('__reactProps$'));
+  const props = reactKey ? input[reactKey] : null;
+  const emit = (text) => {
+    write(text);
+    const native = new InputEvent('input', { bubbles: true, cancelable: true, data: text, inputType: text ? 'insertText' : 'deleteContentBackward' });
+    const synthetic = {
+      target: input,
+      currentTarget: input,
+      nativeEvent: native,
+      preventDefault() {},
+      stopPropagation() {},
+      isDefaultPrevented() { return false; },
+      isPropagationStopped() { return false; },
+    };
+    if (props && typeof props.onChange === 'function') props.onChange(synthetic);
+    else input.dispatchEvent(native);
+  };
+  emit('');
+  emit(next);
+  if (props && typeof props.onBlur === 'function') {
+    props.onBlur({ target: input, currentTarget: input, nativeEvent: new FocusEvent('blur'), preventDefault() {}, stopPropagation() {} });
+  } else {
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.blur();
+  }
+  return { ok: (input.value || '') === next && next.length > 0, value: input.value || '', name: input.getAttribute('name') || '' };
+}
+"""
+
+PROFILE_VISIBLE_JS = """
+() => {
+  const el = document.querySelector('input[name="givenName"], input[autocomplete="given-name"], input[data-testid="givenName"]');
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+"""
+
+INJECT_TURNSTILE_JS = """
+(token) => {
+  const value = String(token || '').trim();
+  if (!value) return { ok: false, reason: 'empty-token' };
+  window.__grokCfToken = value;
+  const setNative = (input) => {
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue('');
+    if (desc && desc.set) desc.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  let filled = 0;
+  document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach((el) => {
+    setNative(el);
+    filled += 1;
+  });
+  if (!filled) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = 'cf-turnstile-response';
+    const form = document.querySelector('form') || document.body;
+    form.appendChild(input);
+    setNative(input);
+    filled = 1;
+  }
+  try {
+    if (window.turnstile) window.turnstile.getResponse = () => window.__grokCfToken || value;
+  } catch (e) {}
+  document.querySelectorAll('[data-callback]').forEach((el) => {
+    const name = el.getAttribute('data-callback');
+    try {
+      if (name && typeof window[name] === 'function') window[name](value);
+    } catch (e) {}
+  });
+  return { ok: true, filled };
+}
+"""
+
 OTP_VISIBLE_JS = """
 () => {
   const n = document.querySelector('input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp]');

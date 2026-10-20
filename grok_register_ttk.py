@@ -4805,7 +4805,15 @@ def run_registration_cli(count):
                                     else (
                                         "协议 companion 缺失"
                                         if companion_miss
-                                        else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                        else (
+                                            "资料页未就绪"
+                                            if profile_soft
+                                            else (
+                                                "资源可重用"
+                                                if reusable and not blank_ui
+                                                else "空页/表单未就绪"
+                                            )
+                                        )
                                     )
                                 )
                             )

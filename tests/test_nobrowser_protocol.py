@@ -244,6 +244,11 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "autocomplete') || '').toLowerCase()" in sdk_text
     assert "no-visible-email" in sdk_text
     assert "EMAIL_INPUT_SELECTOR" in engine_text
+    assert "https://grok.com/sign-up" in engine_text
+    assert "cookie-chain" in engine_text
+    assert "INJECT_TURNSTILE_JS" in sdk_text
+    assert "givenName" in sdk_text
+    assert "press_sequentially" in engine_text
     assert '_resend_verification_code(page, captured, emit, email)' in engine_text
     assert "send-code resend" in engine_text
     assert "skipped submit; email field empty" in engine_text
@@ -526,6 +531,19 @@ def test_outlook_code_miss_switches_mailbox_and_does_not_count():
     assert calls["marked"] == ["box1@outlook.com"]
     miss = RuntimeError("Outlook RT 在 180s 内未收到验证码邮件")
     assert should_count_as_failure(miss) is False
+    switched = RuntimeError(
+        "send-code account:email-signup-unavailable，已换 3 个出口和邮箱 last=a@outlook.com"
+    )
+    limited = RuntimeError(
+        "send-code email:send-validation-code-rate-limited，已换 3 个出口和邮箱 last=a@outlook.com"
+    )
+    changed = RuntimeError(
+        "Page.goto: net::ERR_NETWORK_CHANGED at https://accounts.x.ai/sign-up?redirect=grok-com"
+    )
+    assert should_count_as_failure(switched) is False
+    assert should_count_as_failure(limited) is False
+    assert should_count_as_failure(changed) is False
+    assert should_count_as_failure(RuntimeError("send-code not accepted status=400")) is True
 
 
 def test_patchright_pre_inbox_retries_unspent_then_counts_spent():

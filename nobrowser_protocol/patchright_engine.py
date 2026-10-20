@@ -31,10 +31,13 @@ from nobrowser_protocol.page_sdk import (  # noqa: E402
     CASTLE_MINT_JS,
     CLICK_VISIBLE_JS,
     DUMP_PAGE_JS,
+    FILL_CONTROL_JS,
     FILL_EMAIL_JS,
     FILL_OTP_JS,
+    INJECT_TURNSTILE_JS,
     OTP_VISIBLE_JS,
     PAGE_POST_JS,
+    PROFILE_VISIBLE_JS,
     SENTRY_JS,
     SITEKEY_JS,
     SUBMIT_EMAIL_JS,
@@ -56,6 +59,10 @@ from signup_protocol import (  # noqa: E402
 )
 
 SIGNUP_URL = AUTH_ORIGIN + "/sign-up?redirect=grok-com"
+GROK_SIGNUP_URL = "https://grok.com/sign-up"
+GIVEN_SELECTOR = 'input[name="givenName"], input[autocomplete="given-name"], input[data-testid="givenName"]'
+FAMILY_SELECTOR = 'input[name="familyName"], input[autocomplete="family-name"], input[data-testid="familyName"]'
+PASSWORD_SELECTOR = 'input[name="password"], input[autocomplete="new-password"], input[type="password"]'
 
 
 class ExistingEmailError(RuntimeError):
@@ -682,6 +689,145 @@ def _default_har_path() -> Path:
     return ROOT / "log" / "signup-protocol-full.har"
 
 
+def _cookie_chain_url(url: str) -> bool:
+    text = str(url or "")
+    return any(part in text for part in ("cookie-chain", "delete-cookie", "set-cookie"))
+
+
+def _wait_cookie_chain(page, log: Callable[[str], None], timeout: float = 40.0, grace: float = 3.0) -> str:
+    """Let the page finish the cookie-chain hops the manual signup walks."""
+    started = time.time()
+    saw = False
+    while time.time() - started < timeout:
+        url = str(getattr(page, "url", "") or "")
+        if _cookie_chain_url(url):
+            saw = True
+            page.wait_for_timeout(400)
+            continue
+        if saw or time.time() - started >= grace:
+            if saw:
+                log(f"cookie-chain done url={url[:140]}")
+            return url
+        page.wait_for_timeout(250)
+    url = str(getattr(page, "url", "") or "")
+    log(f"cookie-chain wait expired url={url[:140]}")
+    return url
+
+
+def _open_signup_page(page, log: Callable[[str], None]) -> None:
+    """Match the manual entry: grok.com/sign-up, then accounts sign-up, then cookie-chain."""
+    try:
+        page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
+    except Exception as exc:
+        log(f"grok.com/sign-up: {exc}")
+    page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+    _wait_cookie_chain(page, log)
+    if "sign-up" not in str(getattr(page, "url", "") or ""):
+        page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+        _wait_cookie_chain(page, log, grace=2.0)
+
+
+def _await_flag(captured: dict, key: str, timeout: float = 20.0) -> int:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            status = int(captured.get(key) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status:
+            return status
+        time.sleep(0.25)
+    return 0
+
+
+def _profile_visible(page) -> bool:
+    try:
+        return bool(page.evaluate(PROFILE_VISIBLE_JS))
+    except Exception:
+        return False
+
+
+def _fill_named(page, selector: str, value: str, log: Callable[[str], None]) -> dict:
+    try:
+        loc = page.locator(selector).first
+        loc.wait_for(state="visible", timeout=12000)
+        loc.click(timeout=3000)
+        loc.fill("", timeout=3000)
+        loc.fill(value, timeout=8000)
+    except Exception as exc:
+        log(f"profile locator {selector}: {exc}")
+    try:
+        result = page.evaluate(FILL_CONTROL_JS, {"selector": selector, "value": value}) or {}
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)[:160]}
+    return result if isinstance(result, dict) else {"ok": False}
+
+
+def _type_password(page, password: str, log: Callable[[str], None]) -> None:
+    """Type the password so the page fires ValidatePassword, then sync React state."""
+    try:
+        loc = page.locator(PASSWORD_SELECTOR).first
+        loc.wait_for(state="visible", timeout=8000)
+        loc.click(timeout=3000)
+        loc.fill("", timeout=3000)
+        loc.press_sequentially(password, delay=40)
+    except Exception as exc:
+        log(f"password type: {exc}")
+    _fill_named(page, PASSWORD_SELECTOR, password, log)
+
+
+def _submit_profile(page, log: Callable[[str], None]) -> str:
+    clicked = _click_first(
+        page,
+        ("Complete sign up", "Create account", "Sign up", "Continue", "完成注册", "继续"),
+        timeout=5000,
+        deny=("with email", "with apple", "with google", "privacy", "go back", "resend"),
+    )
+    if clicked:
+        return clicked
+    try:
+        return str(page.evaluate(SUBMIT_EMAIL_JS) or "")
+    except Exception as exc:
+        log(f"profile submit: {exc}")
+        return ""
+
+
+def _sso_from_context(context) -> str:
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return ""
+    for cookie in cookies or []:
+        if str(cookie.get("name") or "").lower() in {"sso", "sso-rw"}:
+            value = str(cookie.get("value") or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _note_auth_response(captured: dict, response) -> None:
+    url = str(getattr(response, "url", "") or "")
+    method = str(getattr(getattr(response, "request", None), "method", "") or "").upper()
+    if method != "POST":
+        return
+    if AUTH_VERIFY_EMAIL in url:
+        key, data_key = "verify_status", "verify_data"
+    elif AUTH_CREATE_ACCOUNT in url:
+        key, data_key = "create_status", "create_data"
+    else:
+        return
+    try:
+        captured[key] = int(response.status)
+    except (TypeError, ValueError):
+        captured[key] = 0
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        captured[data_key] = data
+
+
 def signup_with_patchright(
     *,
     har: Any,
@@ -741,10 +887,17 @@ def signup_with_patchright(
                     f"keys={list((net.get('json') or net.get('verify_json') or net.get('create_json') or {}))[:8]}"
                 )
 
+        def on_response(response):
+            try:
+                _note_auth_response(net, response)
+            except Exception as exc:
+                emit(f"auth response: {exc}")
+
         context.on("request", on_request)
+        context.on("response", on_response)
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(SIGNUP_URL, wait_until="load", timeout=60000)
+            _open_signup_page(page, emit)
             try:
                 page.wait_for_function(
                     "() => /castlePk/.test(document.documentElement.innerHTML) || !!(window.Castle && window.Castle.createRequestToken)",
@@ -836,49 +989,78 @@ def signup_with_patchright(
                 usage.email_used = True
             code = wait_otp(sent_at)
             emit(f"otp len={len(code)}")
-            verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
-            st, data, _raw = _post(page, har, verify, sentry, emit)
-            if (st >= 400 or st == 0) and "-" in code:
-                verify = build_verify_email(email=email, code=code)
+            _fill_otp_and_confirm(page, code, emit)
+            st = _await_flag(captured, "verify_status", timeout=20)
+            data = captured.get("verify_data") if isinstance(captured.get("verify_data"), dict) else {}
+            if not (200 <= st < 300):
+                emit(f"page verify status={st or 'missing'}; fetch fallback")
+                verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
                 st, data, _raw = _post(page, har, verify, sentry, emit)
-            if st >= 400 or st == 0:
-                emit(f"HAR verify-email {st}; fill OTP on live page")
-                _fill_otp_and_confirm(page, code, emit)
-                page.wait_for_timeout(1500)
-                if captured.get("verify_json") or not _otp_visible(page):
-                    st, data = 200, captured.get("verify_json") or {"page": True}
+                if (st >= 400 or st == 0) and "-" in code:
+                    verify = build_verify_email(email=email, code=code)
+                    st, data, _raw = _post(page, har, verify, sentry, emit)
             if st >= 400 or st == 0:
                 raise RuntimeError(f"verify-email {st} {str(data)[:180]}")
+            emit(f"verify-email status={st}")
             if usage is not None:
                 usage.remote_captcha_used = True
+            deadline = time.time() + 20
+            while time.time() < deadline and not _profile_visible(page):
+                page.wait_for_timeout(300)
+            given_fill = _fill_named(page, GIVEN_SELECTOR, given, emit)
+            family_fill = _fill_named(page, FAMILY_SELECTOR, family, emit)
+            _type_password(page, pw, emit)
+            emit(
+                f"profile given={bool(given_fill.get('ok'))} "
+                f"family={bool(family_fill.get('ok'))}"
+            )
+            try:
+                sitekey = str(page.evaluate(SITEKEY_JS) or sitekey or "").strip()
+            except Exception:
+                sitekey = sitekey or ""
             ts_token = solve_ts(sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0")
             emit(f"turnstile len={len(ts_token)}")
-            create = build_create_account(
-                email=email,
-                password=pw,
-                given_name=given,
-                family_name=family,
-                email_validation_code=code,
-                turnstile_token=ts_token,
-                castle_request_token=castle["token"],
-            )
-            create = apply_live_otp(create, code, "emailValidationCode")
-            st, data, _raw = _post(page, har, create, sentry, emit)
+            try:
+                injected = page.evaluate(INJECT_TURNSTILE_JS, ts_token)
+            except Exception as exc:
+                injected = {"ok": False, "reason": str(exc)[:160]}
+            emit(f"turnstile inject={injected!r}")
+            clicked = _submit_profile(page, emit)
+            emit(f"profile submit={clicked!r}")
+            st = _await_flag(captured, "create_status", timeout=30)
+            data = captured.get("create_data") if isinstance(captured.get("create_data"), dict) else {}
+            if not (200 <= st < 300):
+                emit(f"page create status={st or 'missing'}; fetch fallback")
+                minted = _mint_castle(page, email, emit, timeout=8.0)
+                fresh = str((minted or {}).get("token") or "").strip() or str(castle.get("token") or "")
+                create = build_create_account(
+                    email=email,
+                    password=pw,
+                    given_name=given,
+                    family_name=family,
+                    email_validation_code=code,
+                    turnstile_token=ts_token,
+                    castle_request_token=fresh,
+                )
+                create = apply_live_otp(create, code, "emailValidationCode")
+                st, data, _raw = _post(page, har, create, sentry, emit)
             if st >= 400 or st == 0:
                 raise RuntimeError(f"create-account {st} {str(data)[:180]}")
-            sso = sso_from_create_payload(data)
-            if not sso:
-                for cookie in context.cookies():
-                    if str(cookie.get("name") or "").lower() in {"sso", "sso-rw"}:
-                        sso = str(cookie.get("value") or "")
-                        if sso:
-                            break
+            emit(f"create-account status={st}")
+            redirect = str(data.get("redirectUrl") or "") if isinstance(data, dict) else ""
+            if redirect and not _cookie_chain_url(str(getattr(page, "url", "") or "")):
+                try:
+                    page.goto(redirect, wait_until="load", timeout=45000)
+                except Exception as exc:
+                    emit(f"cookie-chain goto: {exc}")
+            _wait_cookie_chain(page, emit, timeout=50, grace=2)
+            sso = _sso_from_context(context) or sso_from_create_payload(data)
             if not sso and existing_email_payload(data):
                 emit(f"existingEmail={email} keys={list(data)[:8]}")
                 raise ExistingEmailError(email, data)
             if not sso:
                 raise RuntimeError(
-                    f"no sso keys={list(data)[:12] if isinstance(data, dict) else type(data)}"
+                    f"no sso after cookie-chain keys={list(data)[:12] if isinstance(data, dict) else type(data)}"
                 )
             emit(f"sso len={len(sso)}")
         finally:

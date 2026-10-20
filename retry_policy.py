@@ -84,11 +84,24 @@ def is_mailbox_code_miss(exc: BaseException | None) -> bool:
     return "未收到验证码" in msg or "收件箱为空" in msg
 
 
+def is_unscored_attempt(exc: BaseException | None) -> bool:
+    """Proxy bounce or an exhausted send-code switch. Keep going; do not score a failure."""
+    msg = str(exc or "")
+    if "ERR_NETWORK_CHANGED" in msg:
+        return True
+    if "已换" not in msg:
+        return False
+    return (
+        "account:email-signup-unavailable" in msg
+        or "email:send-validation-code-rate-limited" in msg
+    )
+
+
 def should_count_as_failure(exc: BaseException | None) -> bool:
     """Fail stats only after mailbox send-code or a paid remote captcha spend."""
     if exc is None:
         return False
-    if is_mailbox_code_miss(exc):
+    if is_mailbox_code_miss(exc) or is_unscored_attempt(exc):
         return False
     if getattr(exc, "email_used", False) or getattr(exc, "remote_captcha_used", False):
         return True
