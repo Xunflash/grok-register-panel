@@ -764,6 +764,11 @@ def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
     )
 
 
+def preamble_ready(flags: dict) -> bool:
+    """HAR send happens only after Turnstile api.js, a cookie hop, and /sign-in."""
+    return bool(flags.get("turnstile") and flags.get("cookie") and flags.get("sign_in"))
+
+
 def _note_send_preamble(flags: dict, request) -> None:
     """Record the requests the HAR shows on the sign-up document before send-code."""
     url = str(getattr(request, "url", "") or "")
@@ -780,9 +785,12 @@ def _wait_send_preamble(page, flags: dict, log: Callable[[str], None], timeout: 
     """Stay on the sign-up document until Turnstile and the sign-in/set-cookie prelude finish."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if flags.get("turnstile") and (flags.get("cookie") or flags.get("sign_in")):
+        if preamble_ready(flags):
             break
         page.wait_for_timeout(250)
+    if preamble_ready(flags):
+        # HAR waited through monitoring/RUM after /sign-in before the POST.
+        page.wait_for_timeout(8000)
     log(
         "send preamble "
         f"turnstile={bool(flags.get('turnstile'))} "
@@ -810,6 +818,9 @@ def _open_signup_page(page, log: Callable[[str], None]) -> None:
             page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
         except Exception as exc:
             log(f"grok.com/sign-up: {exc}")
+        # Only the accounts sign-up document counts. Cookie-chain already
+        # visited /sign-in and delete-cookie, which must not satisfy the prelude.
+        preamble.clear()
         _goto_accounts_signup(page, log)
         log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
         _wait_send_preamble(page, preamble, log)

@@ -238,9 +238,45 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_resend_allowed("email:send-validation-code-rate-limited") is False
     assert _send_code_resend_allowed("form-invalid:email:email") is False
     assert _send_code_resend_allowed("account:missing-email") is True
-    from nobrowser_protocol.patchright_engine import _otp_for_page
+    from nobrowser_protocol.patchright_engine import _accounts_signup_url, _otp_for_page, preamble_ready
 
     assert _otp_for_page("123-456") == "123456"
+    signup_url = _accounts_signup_url()
+    for key in (
+        "redirect=grok-com",
+        "return_to=%2F",
+        "mwbv=true",
+        "htid=",
+        "analytics_consent=true",
+        "advertising_consent=true",
+    ):
+        assert key in signup_url
+    assert preamble_ready({"turnstile": True, "cookie": True, "sign_in": True}) is True
+    assert preamble_ready({"turnstile": True, "cookie": False, "sign_in": True}) is False
+    assert preamble_ready({"turnstile": True, "cookie": True, "sign_in": False}) is False
+    send = build_send_verification_code(email="a@b.c", castle_request_token="castle")
+    assert set(send["json"]) == {"email", "castleRequestToken"}
+    verify = build_verify_email(email="a@b.c", code="12-34-56")
+    assert set(verify["json"]) == {"email", "code"}
+    assert verify["json"]["code"] == "123456"
+    create = build_create_account(
+        email="a@b.c",
+        password="pw",
+        given_name="A",
+        family_name="B",
+        email_validation_code="123456",
+        turnstile_token="ts",
+        castle_request_token="castle",
+    )
+    assert set(create["json"]) == {
+        "email",
+        "password",
+        "givenName",
+        "familyName",
+        "emailValidationCode",
+        "turnstileToken",
+        "castleRequestToken",
+    }
     assert _otp_for_page("ABC123456") == "123456"
     assert len(_otp_for_page("12-34-56")) == 6
     assert 'input[type="email"], input[name="email"]' not in sdk_text
