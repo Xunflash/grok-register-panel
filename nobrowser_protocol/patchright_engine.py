@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
@@ -729,12 +730,22 @@ def _chrome_error_navigation(text: object) -> bool:
     )
 
 
+def _accounts_signup_url() -> str:
+    """Same query the manual HAR used on the send-code referer."""
+    htid = str(uuid.uuid4())
+    return (
+        f"{SIGNUP_URL}&return_to=%2F&mwbv=true&htid={htid}"
+        "&analytics_consent=true&advertising_consent=true"
+    )
+
+
 def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
     """Open the accounts sign-up page. A chrome-error interrupt is retried, not fatal."""
     last = ""
+    target = _accounts_signup_url()
     for attempt in range(1, 4):
         try:
-            page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=45000)
+            page.goto(target, wait_until="domcontentloaded", timeout=45000)
         except Exception as exc:
             last = str(exc)
             log(f"sign-up goto {attempt}/3: {exc}")
@@ -749,7 +760,7 @@ def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
         log(f"sign-up landed on chrome-error {attempt}/3")
         page.wait_for_timeout(600)
     raise RuntimeError(
-        f'Page.goto: Navigation to "{SIGNUP_URL}" is interrupted by another navigation to "{last}"'
+        f'Page.goto: Navigation to "{target}" is interrupted by another navigation to "{last}"'
     )
 
 
@@ -760,6 +771,7 @@ def _open_signup_page(page, log: Callable[[str], None]) -> None:
     except Exception as exc:
         log(f"grok.com/sign-up: {exc}")
     _goto_accounts_signup(page, log)
+    log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
     _wait_cookie_chain(page, log)
     if _chrome_error_navigation(getattr(page, "url", "")) or "sign-up" not in str(
         getattr(page, "url", "") or ""
