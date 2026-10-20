@@ -1,0 +1,258 @@
+[
+  {
+    "t": "2026-10-20T08:26:08",
+    "method": "GET",
+    "status": 0,
+    "host": "accounts.x.ai",
+    "path": "/sign-out",
+    "query": [
+      "mwbv",
+      "redirect"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:16",
+    "method": "GET",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/cookie-chain",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:23",
+    "method": "GET",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/cookie-chain",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:24",
+    "method": "GET",
+    "status": 0,
+    "host": "auth.cursor.com",
+    "path": "/delete-cookie",
+    "query": [],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:27",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/cookie-chain",
+    "query": [],
+    "json_keys": [
+      "reachable",
+      "q"
+    ]
+  },
+  {
+    "t": "2026-10-20T08:26:52",
+    "method": "GET",
+    "status": 503,
+    "host": "grok.com",
+    "path": "/sign-up",
+    "query": [
+      "return_to"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:59",
+    "method": "GET",
+    "status": 0,
+    "host": "accounts.x.ai",
+    "path": "/sign-up",
+    "query": [
+      "advertising_consent",
+      "analytics_consent",
+      "htid",
+      "mwbv",
+      "redirect",
+      "return_to"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:26:56",
+    "method": "GET",
+    "status": 0,
+    "host": "accounts.x.ai",
+    "path": "/sign-up",
+    "query": [
+      "advertising_consent",
+      "analytics_consent",
+      "htid",
+      "mwbv",
+      "redirect",
+      "return_to"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:27:03",
+    "method": "GET",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/sign-up",
+    "query": [
+      "advertising_consent",
+      "analytics_consent",
+      "htid",
+      "mwbv",
+      "redirect",
+      "return_to"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:27:14",
+    "method": "GET",
+    "status": 400,
+    "host": "auth.cursor.com",
+    "path": "/set-cookie",
+    "query": [],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:27:35",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/auth/send-verification-code",
+    "query": [],
+    "json_keys": [
+      "castleRequestToken",
+      "email"
+    ]
+  },
+  {
+    "t": "2026-10-20T08:27:49",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/auth/sign-up/verify-email",
+    "query": [],
+    "json_keys": [
+      "code",
+      "email"
+    ]
+  },
+  {
+    "t": "2026-10-20T08:28:52",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/auth/sign-up/create-account",
+    "query": [],
+    "json_keys": [
+      "castleRequestToken",
+      "email",
+      "emailValidationCode",
+      "familyName",
+      "givenName",
+      "password",
+      "turnstileToken"
+    ]
+  },
+  {
+    "t": "2026-10-20T08:28:53",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/sign-up",
+    "query": [
+      "advertising_consent",
+      "analytics_consent",
+      "htid",
+      "mwbv",
+      "redirect",
+      "return_to"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:28:54",
+    "method": "GET",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/cookie-chain",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:29:01",
+    "method": "GET",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/cookie-chain",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:29:02",
+    "method": "GET",
+    "status": 0,
+    "host": "auth.cursor.com",
+    "path": "/set-cookie",
+    "query": [],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:29:05",
+    "method": "POST",
+    "status": 200,
+    "host": "accounts.x.ai",
+    "path": "/api/cookie-chain",
+    "query": [],
+    "json_keys": [
+      "reachable",
+      "q"
+    ]
+  },
+  {
+    "t": "2026-10-20T08:29:08",
+    "method": "GET",
+    "status": 0,
+    "host": "auth.grokusercontent.com",
+    "path": "/set-cookie",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:29:20",
+    "method": "GET",
+    "status": 0,
+    "host": "auth.grok.com",
+    "path": "/set-cookie",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  },
+  {
+    "t": "2026-10-20T08:29:31",
+    "method": "GET",
+    "status": 0,
+    "host": "auth.grok.com",
+    "path": "/set-cookie",
+    "query": [
+      "q"
+    ],
+    "json_keys": []
+  }
+]

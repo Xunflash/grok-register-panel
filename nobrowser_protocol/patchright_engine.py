@@ -60,7 +60,28 @@ from signup_protocol import (  # noqa: E402
 )
 
 SIGNUP_URL = AUTH_ORIGIN + "/sign-up?redirect=grok-com"
-GROK_SIGNUP_URL = "https://grok.com/sign-up"
+GROK_HOME_URL = "https://grok.com/"
+GROK_SIGNUP_URL = "https://grok.com/sign-up?return_to=%2F"
+HAR_SIGNUP_QUERY_KEYS = (
+    "advertising_consent",
+    "analytics_consent",
+    "htid",
+    "mwbv",
+    "redirect",
+    "return_to",
+)
+
+
+def har_signup_navigation() -> list[str]:
+    """Document order from the successful manual HAR, before send-code."""
+    return [
+        "grok.com",
+        "sign-out",
+        "cookie-chain",
+        "grok.com/sign-up",
+        "accounts.sign-up",
+        "prelude",
+    ]
 GIVEN_SELECTOR = 'input[name="givenName"], input[autocomplete="given-name"], input[data-testid="givenName"]'
 FAMILY_SELECTOR = 'input[name="familyName"], input[autocomplete="family-name"], input[data-testid="familyName"]'
 PASSWORD_SELECTOR = 'input[name="password"], input[autocomplete="new-password"], input[type="password"]'
@@ -802,7 +823,7 @@ def _wait_send_preamble(page, flags: dict, log: Callable[[str], None], timeout: 
 
 
 def _open_signup_page(page, log: Callable[[str], None]) -> None:
-    """Match the manual HAR: cookie-chain, grok.com/sign-up, then stay on accounts sign-up."""
+    """HAR order: grok.com, sign-out into cookie-chain?q=, grok sign-up, stay on accounts sign-up."""
     preamble: dict[str, bool] = {}
 
     def on_request(request):
@@ -811,19 +832,31 @@ def _open_signup_page(page, log: Callable[[str], None]) -> None:
     page.on("request", on_request)
     try:
         try:
-            page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
+            page.goto(GROK_HOME_URL, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
-            log(f"cookie-chain open: {exc}")
+            log(f"grok.com: {exc}")
+        try:
+            page.goto(AUTH_ORIGIN + "/sign-out", wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            log(f"sign-out: {exc}")
+        if "cookie-chain" not in str(getattr(page, "url", "") or ""):
+            try:
+                page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
+            except Exception as exc:
+                log(f"cookie-chain open: {exc}")
         _wait_cookie_chain(page, log, timeout=40, grace=8)
         log(f"after cookie-chain url={str(getattr(page, 'url', '') or '')[:180]}")
         try:
             page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
         except Exception as exc:
             log(f"grok.com/sign-up: {exc}")
-        # Only the accounts sign-up document counts. Cookie-chain already
-        # visited /sign-in and delete-cookie, which must not satisfy the prelude.
+        # Prelude is only what the sign-up document itself requests.
         preamble.clear()
-        _goto_accounts_signup(page, log)
+        current = str(getattr(page, "url", "") or "")
+        if "accounts.x.ai/sign-up" not in current or not set(HAR_SIGNUP_QUERY_KEYS).issubset(
+            set(_query_keys(current))
+        ):
+            _goto_accounts_signup(page, log)
         log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
         _wait_send_preamble(page, preamble, log)
         if _chrome_error_navigation(getattr(page, "url", "")):
@@ -834,6 +867,12 @@ def _open_signup_page(page, log: Callable[[str], None]) -> None:
             page.remove_listener("request", on_request)
         except Exception:
             pass
+
+
+def _query_keys(url: str) -> list[str]:
+    from urllib.parse import parse_qs, urlsplit
+
+    return sorted(parse_qs(urlsplit(str(url or "")).query))
 
 
 def _await_flag(captured: dict, key: str, timeout: float = 20.0) -> int:

@@ -437,6 +437,71 @@ def test_existing_email_payload_and_engine_raises():
     assert "existingEmail=a@b.c" in str(err)
 
 
+def test_har_signup_order_and_request_shapes():
+    """Shipped helpers must follow the successful HAR order and JSON keys."""
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    from nobrowser_protocol.patchright_engine import (
+        GROK_SIGNUP_URL,
+        HAR_SIGNUP_QUERY_KEYS,
+        _accounts_signup_url,
+        _otp_for_page,
+        har_signup_navigation,
+        preamble_ready,
+    )
+    from signup_protocol import (
+        build_create_account,
+        build_send_verification_code,
+        build_verify_email,
+    )
+
+    steps = har_signup_navigation()
+    assert steps.index("cookie-chain") < steps.index("grok.com/sign-up")
+    assert steps.index("grok.com/sign-up") < steps.index("accounts.sign-up")
+    assert steps.index("accounts.sign-up") < steps.index("prelude")
+    assert "return_to=%2F" in GROK_SIGNUP_URL
+    signup_url = _accounts_signup_url()
+    assert set(HAR_SIGNUP_QUERY_KEYS).issubset(set(parse_qs(urlsplit(signup_url).query)))
+    send = build_send_verification_code(email="user@outlook.com", castle_request_token="castle")
+    assert sorted(send["json"]) == ["castleRequestToken", "email"]
+    assert send["path"].endswith("/api/auth/send-verification-code")
+    verify = build_verify_email(email="user@outlook.com", code="123-456")
+    assert sorted(verify["json"]) == ["code", "email"]
+    assert verify["json"]["code"] == "123456"
+    assert len(verify["json"]["code"]) == 6
+    assert _otp_for_page("12-34-56") == "123456"
+    create = build_create_account(
+        email="user@outlook.com",
+        password="pw",
+        given_name="Ada",
+        family_name="Lovelace",
+        email_validation_code="123-456",
+        turnstile_token="ts",
+        castle_request_token="castle",
+    )
+    assert set(create["json"]) == {
+        "castleRequestToken",
+        "email",
+        "emailValidationCode",
+        "familyName",
+        "givenName",
+        "password",
+        "turnstileToken",
+    }
+    assert create["json"]["emailValidationCode"] == "123456"
+    assert preamble_ready({"turnstile": True, "cookie": True, "sign_in": True})
+    assert not preamble_ready({"turnstile": True, "sign_in": True})
+    fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "successful_signup_har.json").read_text(encoding="utf-8")
+    )
+    paths = [row["path"] for row in fixture]
+    assert paths.index("/cookie-chain") < paths.index("/sign-up")
+    send_row = next(row for row in fixture if row["path"].endswith("send-verification-code"))
+    assert send_row["json_keys"] == ["castleRequestToken", "email"]
+    assert send_row["status"] == 200
+
+
 def test_patchright_panel_retries_existing_email_and_marks_used():
     from nobrowser_protocol.patchright_engine import ExistingEmailError
     from signup_scheme import retry_patchright_mailboxes
