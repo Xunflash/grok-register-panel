@@ -394,11 +394,13 @@ EMAIL_INPUT_SELECTOR = (
 
 
 def _fill_signup_email(page, email: str, log: Callable[[str], None]) -> dict:
-    """Write the address into the visible email-step field and its React state."""
+    """Type the address the way the HAR session did, then sync React state."""
     try:
         loc = page.locator(EMAIL_INPUT_SELECTOR).first
         loc.wait_for(state="visible", timeout=20000)
-        loc.fill(email, timeout=8000)
+        loc.click(timeout=3000)
+        loc.fill("", timeout=3000)
+        loc.press_sequentially(email, delay=70)
     except Exception as exc:
         log(f"locator fill: {exc}")
     try:
@@ -966,7 +968,9 @@ def signup_with_patchright(
     given = random.choice(FIRST)
     family = random.choice(LAST)
     proxy_cfg = _proxy_for_patchright(proxy)
-    user_dir = tempfile.mkdtemp(prefix="patchright-ctx-")
+    shared_profile = str(os.environ.get("PATCHRIGHT_USER_DATA") or "").strip()
+    keep_profile = bool(shared_profile)
+    user_dir = shared_profile or tempfile.mkdtemp(prefix="patchright-ctx-")
     headed = bool(os.environ.get("DISPLAY") or os.environ.get("PATCHRIGHT_HEADED"))
     chrome = _chrome_path()
     sso = ""
@@ -975,7 +979,6 @@ def signup_with_patchright(
         launch_kw: dict[str, Any] = {
             "headless": not headed,
             "no_viewport": True,
-            "args": ["--disable-blink-features=AutomationControlled"],
         }
         if proxy_cfg:
             launch_kw["proxy"] = proxy_cfg
@@ -1180,7 +1183,8 @@ def signup_with_patchright(
                     browser.close()
                 except Exception:
                     pass
-            shutil.rmtree(user_dir, ignore_errors=True)
+            if not keep_profile:
+                shutil.rmtree(user_dir, ignore_errors=True)
     if not sso:
         raise RuntimeError("patchright signup returned no sso")
     return {
