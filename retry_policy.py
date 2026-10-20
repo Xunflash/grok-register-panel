@@ -89,6 +89,7 @@ def is_unscored_attempt(exc: BaseException | None) -> bool:
     msg = str(exc or "")
     if (
         "ERR_NETWORK_CHANGED" in msg
+        or "ERR_TUNNEL_CONNECTION_FAILED" in msg
         or "chrome-error://chromewebdata" in msg
         or "interrupted by another navigation" in msg
     ):

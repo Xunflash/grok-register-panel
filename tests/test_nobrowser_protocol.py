@@ -553,6 +553,10 @@ def test_outlook_code_miss_switches_mailbox_and_does_not_count():
         'is interrupted by another navigation to "chrome-error://chromewebdata/"'
     )
     assert should_count_as_failure(interrupted) is False
+    tunnel = RuntimeError(
+        'Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://accounts.x.ai/sign-up?redirect=grok-com'
+    )
+    assert should_count_as_failure(tunnel) is False
     assert should_count_as_failure(RuntimeError("send-code not accepted status=400")) is True
 
 

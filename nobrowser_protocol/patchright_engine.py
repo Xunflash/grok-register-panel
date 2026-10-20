@@ -721,7 +721,12 @@ def _wait_cookie_chain(page, log: Callable[[str], None], timeout: float = 40.0, 
 
 def _chrome_error_navigation(text: object) -> bool:
     raw = str(text or "")
-    return "chrome-error://chromewebdata" in raw or "interrupted by another navigation" in raw
+    return (
+        "chrome-error://chromewebdata" in raw
+        or "interrupted by another navigation" in raw
+        or "ERR_TUNNEL_CONNECTION_FAILED" in raw
+        or "ERR_NETWORK_CHANGED" in raw
+    )
 
 
 def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
