@@ -3037,6 +3037,11 @@ def current_registration_scheme() -> str:
     return load_registration_scheme(config=config)
 
 
+def _patchright_skips_camoufox() -> bool:
+    """Patchright launches its own Chromium. Camoufox boot is not part of that flow."""
+    return current_registration_scheme() == SCHEME_PROTOCOL_PATCHRIGHT
+
+
 def run_browser_signup(log_callback, cancel_callback, *, mail_retries=3):
     """Original Camoufox form-click signup. Returns email/profile/sso."""
     email = ""
@@ -4169,7 +4174,10 @@ class GrokRegisterGUI:
 
         try:
             try:
-                start_browser(log_callback=wlog)
+                if _patchright_skips_camoufox():
+                    wlog("[*] Patchright 方案不启动 Camoufox")
+                else:
+                    start_browser(log_callback=wlog)
             except Exception as boot_exc:
                 streak = get_start_fail_streak()
                 wlog(
@@ -4182,7 +4190,10 @@ class GrokRegisterGUI:
                     self._record_failure(boot_exc)
                 self.update_stats()
                 return
-            wlog("[*] 浏览器已启动")
+            if _patchright_skips_camoufox():
+                wlog("[*] 跳过 Camoufox，进入 Patchright 注册")
+            else:
+                wlog("[*] 浏览器已启动")
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = slot_retries()
@@ -4571,7 +4582,10 @@ def run_registration_cli(count):
                 set_thread_proxy(px)
                 cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
                 try:
-                    start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                    if _patchright_skips_camoufox():
+                        cli_log(f"[W{wid+1}] [*] Patchright 方案不启动 Camoufox")
+                    else:
+                        start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
                     record_proxy_boot_failure(px, boot_exc)
                     # 黑名单/死代理：多换几条 sticky 再放弃
@@ -4917,7 +4931,8 @@ def run_registration_cli(count):
                                 px = pick_proxy_for_worker(wid, rotate_idx)
                                 set_thread_proxy(px)
                                 cli_log(f"[W{wid+1}] [*] 下号代理: {redact_proxy(px)}")
-                                start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                                if not _patchright_skips_camoufox():
+                                    start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                                 time.sleep(0.5)
                             except Exception as boot_exc:
                                 last_boot = boot_exc
@@ -5032,6 +5047,10 @@ def run_registration_cli(count):
                 px = pick_proxy_for_worker(0, single_rotate_idx)
                 set_thread_proxy(px)
                 cli_log(f"[*] 绑定代理: {redact_proxy(px) or '直连'}")
+                if _patchright_skips_camoufox():
+                    cli_log("[*] Patchright 方案不启动 Camoufox")
+                    last_boot = None
+                    break
                 start_browser(log_callback=cli_log)
                 last_boot = None
                 break
@@ -5055,7 +5074,10 @@ def run_registration_cli(count):
                 log_callback=cli_log,
             )
             return
-        cli_log("[*] 浏览器已启动")
+        if _patchright_skips_camoufox():
+            cli_log("[*] 跳过 Camoufox，进入 Patchright 注册")
+        else:
+            cli_log("[*] 浏览器已启动")
         i = 0
         while i < count:
             if controller.should_stop():
