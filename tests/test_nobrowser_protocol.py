@@ -238,6 +238,11 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_resend_allowed("email:send-validation-code-rate-limited") is False
     assert _send_code_resend_allowed("form-invalid:email:email") is False
     assert _send_code_resend_allowed("account:missing-email") is True
+    from nobrowser_protocol.patchright_engine import _otp_for_page
+
+    assert _otp_for_page("123-456") == "123456"
+    assert _otp_for_page("ABC123456") == "123456"
+    assert len(_otp_for_page("12-34-56")) == 6
     assert 'input[type="email"], input[name="email"]' not in sdk_text
     assert 'input[data-testid="email"]' in sdk_text
     assert "__reactProps$" in sdk_text

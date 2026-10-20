@@ -327,30 +327,34 @@ def _send_code_succeeded(captured: dict | None, otp_visible: bool = False) -> bo
     return False
 
 
+def _otp_for_page(code: str) -> str:
+    """The live form posts a 6-digit code, without a hyphen."""
+    digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[:6]
+    return str(code or "").strip()
+
+
 def _fill_otp_and_confirm(page, code: str, log: Callable[[str], None]) -> str:
-    live = str(code or "").strip()
-    digits = "".join(ch for ch in live if ch.isalnum())
+    value = _otp_for_page(code)
     filled = ""
-    for value in (live, digits):
-        if not value:
-            continue
-        try:
-            loc = page.locator(
-                'input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp]'
-            ).first
-            loc.wait_for(state="visible", timeout=8000)
-            loc.fill(value, timeout=5000)
+    selector = 'input[name="code"], input[autocomplete="one-time-code"], input[data-input-otp]'
+    try:
+        loc = page.locator(selector).first
+        loc.wait_for(state="visible", timeout=8000)
+        loc.click(timeout=3000)
+        loc.fill("", timeout=3000)
+        loc.fill(value, timeout=5000)
+        filled = value
+    except Exception as exc:
+        log(f"otp locator fill: {exc}")
+    try:
+        react = page.evaluate(FILL_CONTROL_JS, {"selector": selector, "value": value}) or {}
+        log(f"otp react fill={react!r}")
+        if react.get("ok"):
             filled = value
-            break
-        except Exception as exc:
-            log(f"otp locator fill: {exc}")
-    if not filled:
-        try:
-            react = page.evaluate(FILL_OTP_JS, live or digits)
-            log(f"otp react fill={react!r}")
-            filled = live or digits
-        except Exception as exc:
-            log(f"otp react fill: {exc}")
+    except Exception as exc:
+        log(f"otp react fill: {exc}")
     clicked = _click_first(
         page,
         ("Confirm email", "Confirm", "Verify", "Continue", "确认", "验证"),
@@ -987,18 +991,17 @@ def signup_with_patchright(
                 raise RuntimeError("send-code not fired and castle missing")
             if usage is not None:
                 usage.email_used = True
-            code = wait_otp(sent_at)
-            emit(f"otp len={len(code)}")
+            code = _otp_for_page(wait_otp(sent_at))
+            emit(f"otp digits={len(code)}")
             _fill_otp_and_confirm(page, code, emit)
             st = _await_flag(captured, "verify_status", timeout=20)
             data = captured.get("verify_data") if isinstance(captured.get("verify_data"), dict) else {}
+            if not (200 <= st < 300) and _profile_visible(page):
+                st, data = 200, data or {"page": True}
             if not (200 <= st < 300):
                 emit(f"page verify status={st or 'missing'}; fetch fallback")
-                verify = apply_live_otp(build_verify_email(email=email, code=code), code, "code")
+                verify = build_verify_email(email=email, code=code)
                 st, data, _raw = _post(page, har, verify, sentry, emit)
-                if (st >= 400 or st == 0) and "-" in code:
-                    verify = build_verify_email(email=email, code=code)
-                    st, data, _raw = _post(page, har, verify, sentry, emit)
             if st >= 400 or st == 0:
                 raise RuntimeError(f"verify-email {st} {str(data)[:180]}")
             emit(f"verify-email status={st}")
@@ -1025,7 +1028,11 @@ def signup_with_patchright(
             except Exception as exc:
                 injected = {"ok": False, "reason": str(exc)[:160]}
             emit(f"turnstile inject={injected!r}")
-            clicked = _submit_profile(page, emit)
+            if _profile_visible(page):
+                clicked = _submit_profile(page, emit)
+            else:
+                clicked = ""
+                _dump_page(page, emit, "profile-missing")
             emit(f"profile submit={clicked!r}")
             st = _await_flag(captured, "create_status", timeout=30)
             data = captured.get("create_data") if isinstance(captured.get("create_data"), dict) else {}
