@@ -52,6 +52,7 @@ from batch_traffic import mark_successful_account
 from retry_policy import (
     ReusableResourceError,
     proxy_boot_rotations,
+    is_mailbox_code_miss,
     should_count_as_failure,
     slot_retries,
 )
@@ -4302,6 +4303,13 @@ class GrokRegisterGUI:
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    if is_mailbox_code_miss(exc):
+                        settle_outcome = "retryable"
+                        wlog(
+                            "[!] Outlook 未收到验证码，换邮箱继续，不计失败: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
+                        continue
                     if not should_count_as_failure(exc):
                         retry_count_for_slot += 1
                         settle_outcome = "retryable"
@@ -5176,6 +5184,13 @@ def run_registration_cli(count):
                     i += 1
                     mark_slot_completed()
             except Exception as exc:
+                if is_mailbox_code_miss(exc):
+                    settle_outcome = "retryable"
+                    cli_log(
+                        "[!] Outlook 未收到验证码，换邮箱继续，不计失败: "
+                        f"{redact_sensitive_log_line(str(exc))}"
+                    )
+                    continue
                 if not should_count_as_failure(exc):
                     retry_count_for_slot += 1
                     settle_outcome = "retryable"

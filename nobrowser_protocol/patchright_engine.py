@@ -282,7 +282,8 @@ def _otp_visible(page) -> bool:
         return False
 
 
-def _send_code_succeeded(captured: dict | None, otp_visible: bool = False) -> bool:
+def _send_code_fired(captured: dict | None, otp_visible: bool = False) -> bool:
+    """The page submitted send-code. This does not confirm a 2xx response."""
     cap = captured or {}
     if str(cap.get("token") or "").strip():
         return True
@@ -293,6 +294,26 @@ def _send_code_succeeded(captured: dict | None, otp_visible: bool = False) -> bo
     if how in {"page_send_code_request", "page_otp_form"}:
         return True
     return bool(otp_visible)
+
+
+def _send_code_succeeded(captured: dict | None, otp_visible: bool = False) -> bool:
+    """True only when the send-code response is 2xx, or the OTP form is already up.
+
+    A captured request body means the browser fired the call. It does not mean
+    x.ai accepted it and sent mail.
+    """
+    cap = captured or {}
+    status = cap.get("send_status")
+    try:
+        status_code = int(status or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code:
+        return 200 <= status_code < 300
+    how = str(cap.get("how") or "")
+    if how == "page_otp_form" or otp_visible:
+        return True
+    return False
 
 
 def _fill_otp_and_confirm(page, code: str, log: Callable[[str], None]) -> str:
@@ -362,7 +383,19 @@ def _capture_send_code(
     def on_request(request):
         _capture_auth_headers(captured, request)
 
+    def on_response(response):
+        try:
+            if AUTH_SEND_CODE not in str(response.url or ""):
+                return
+            if str(getattr(response.request, "method", "") or "").upper() != "POST":
+                return
+            captured["send_status"] = int(response.status)
+            log(f"send-code response status={response.status}")
+        except Exception as exc:
+            log(f"send-code response read: {exc}")
+
     page.on("request", on_request)
+    page.on("response", on_response)
     try:
         _open_email_form(page, log)
         loc = page.locator(
@@ -422,6 +455,49 @@ def _capture_send_code(
     captured.setdefault("token", "")
     captured.setdefault("json", {})
     return captured
+
+
+def _await_send_status(captured: dict, timeout: float = 8.0) -> int:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            status = int(captured.get("send_status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status:
+            return status
+        time.sleep(0.2)
+    try:
+        return int(captured.get("send_status") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resend_verification_code(page, captured: dict, log: Callable[[str], None]) -> int:
+    """Click resend up to three times until send-verification-code returns 2xx."""
+    for attempt in range(1, 4):
+        previous = int(captured.get("send_status") or 0)
+        captured["send_status"] = 0
+        clicked = _click_first(
+            page,
+            ("Resend code", "Resend", "Send again", "Send code", "重新发送", "重发"),
+            timeout=4000,
+            deny=("privacy", "with email"),
+        )
+        if not clicked:
+            clicked = _click_first(page, SUBMIT_NEEDLES, timeout=4000, deny=SUBMIT_DENY)
+        log(f"send-code resend {attempt}/3 click={clicked!r}")
+        status = _await_send_status(captured, timeout=12.0)
+        if not status:
+            status = previous
+            captured["send_status"] = previous
+        log(f"send-code resend {attempt}/3 status={status}")
+        if 200 <= status < 300:
+            return status
+    try:
+        return int(captured.get("send_status") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _mint_castle(page, email: str, log: Callable[[str], None], timeout: float = 45.0) -> dict:
@@ -590,9 +666,9 @@ def signup_with_patchright(
             captured = _capture_send_code(
                 page, email, emit, timeout=45.0, captured=net
             )
-            sent_via_page = _send_code_succeeded(captured, otp_visible=_otp_visible(page))
-            if sent_via_page and usage is not None:
-                usage.email_used = True
+            otp_visible = _otp_visible(page)
+            sent_via_page = _send_code_fired(captured, otp_visible=otp_visible)
+            accepted = _send_code_succeeded(captured, otp_visible=otp_visible)
             minted = {}
             if not captured.get("token") and not sent_via_page:
                 emit("page XHR empty; try Castle SDK evaluate")
@@ -623,17 +699,34 @@ def signup_with_patchright(
             except Exception:
                 sitekey = ""
             if sent_via_page:
-                emit("send-code already fired by live page SDK")
+                status = _await_send_status(captured) if not accepted else int(captured.get("send_status") or 0)
+                emit(f"send-code response status={status or 'unconfirmed'}")
+                if not accepted and not (200 <= status < 300):
+                    emit(f"send-code not accepted status={status or 'missing'}; resend")
+                    status = _resend_verification_code(page, captured, emit)
+                    sent_at = time.time()
+                    accepted = 200 <= status < 300 or _otp_visible(page)
+                if not accepted:
+                    raise RuntimeError(f"send-code not accepted status={status} after 3 resends")
+                if usage is not None:
+                    usage.email_used = True
+                emit("send-code accepted")
             elif castle.get("token"):
                 send = build_send_verification_code(
                     email=email, castle_request_token=castle["token"]
                 )
                 assert_send_code_has_castle(send)
+                st = 0
+                data: Any = {}
+                for attempt in range(1, 4):
+                    st, data, _raw = _post(page, har, send, sentry, emit)
+                    emit(f"send-code post {attempt}/3 status={st}")
+                    if 200 <= st < 300:
+                        break
+                if st >= 400 or st == 0:
+                    raise RuntimeError(f"send-code {st} {str(data)[:180]} after 3 resends")
                 if usage is not None:
                     usage.email_used = True
-                st, data, _raw = _post(page, har, send, sentry, emit)
-                if st >= 400 or st == 0:
-                    raise RuntimeError(f"send-code {st} {str(data)[:180]}")
             else:
                 raise RuntimeError("send-code not fired and castle missing")
             if usage is not None:

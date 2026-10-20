@@ -120,6 +120,7 @@ def retry_patchright_mailboxes(
     from nobrowser_protocol.patchright_engine import ExistingEmailError
 
     last_existing = ""
+    missed_code = False
     tries = max(1, int(max_tries or 3))
     for mail_try in range(1, tries + 1):
         cancel()
@@ -132,9 +133,24 @@ def retry_patchright_mailboxes(
             mark_used(last_existing)
             log(f"[!] existingEmail={last_existing}, retry another mailbox")
             continue
+        except Exception as exc:
+            from retry_policy import is_mailbox_code_miss
+
+            if not is_mailbox_code_miss(exc):
+                raise
+            missed_code = True
+            last_existing = email
+            try:
+                mark_used(email)
+            except Exception:
+                pass
+            log(f"[!] 验证码未到，换邮箱重试（不计失败）: {exc}")
+            continue
         if not isinstance(outcome, dict) or not outcome.get("sso"):
             raise RuntimeError("patchright signup returned no sso")
         return outcome
+    if missed_code:
+        raise RuntimeError(f"未收到验证码，已换 {tries} 个邮箱 last={last_existing}")
     raise RuntimeError(f"existingEmail after mailbox retries last={last_existing}")
 
 

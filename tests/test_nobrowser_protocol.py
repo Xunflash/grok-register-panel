@@ -226,7 +226,9 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
             os_environ.pop(ENV_NAME, None)
         else:
             os_environ[ENV_NAME] = old
-    assert _send_code_succeeded({"token": "x"}) is True
+    assert _send_code_succeeded({"token": "x"}) is False
+    assert _send_code_succeeded({"token": "x", "send_status": 200}) is True
+    assert _send_code_succeeded({"token": "x", "send_status": 502}) is False
     assert _send_code_succeeded({"how": "page_otp_form"}) is True
     assert _send_code_succeeded({}, otp_visible=True) is True
     assert _send_code_succeeded({"how": "page_send_code_timeout"}, otp_visible=False) is False
@@ -410,6 +412,38 @@ def test_patchright_panel_retries_existing_email_and_marks_used():
     assert "retry_patchright_mailboxes" in (
         ROOT / "signup_scheme.py"
     ).read_text(encoding="utf-8")
+
+
+def test_outlook_code_miss_switches_mailbox_and_does_not_count():
+    from retry_policy import should_count_as_failure
+    from signup_scheme import retry_patchright_mailboxes
+
+    calls = {"mail": 0, "marked": []}
+
+    def take_mailbox():
+        calls["mail"] += 1
+        return f"box{calls['mail']}@outlook.com", f"tok{calls['mail']}"
+
+    def signup(email, _token):
+        if email != "box2@outlook.com":
+            raise RuntimeError("Outlook RT 在 180s 内未收到验证码邮件")
+        return {"email": email, "sso": "sso", "password": "pw", "given_name": "A", "family_name": "B"}
+
+    def mark_used(email):
+        calls["marked"].append(email)
+
+    out = retry_patchright_mailboxes(
+        take_mailbox=take_mailbox,
+        signup=signup,
+        mark_used=mark_used,
+        log=lambda _m: None,
+        cancel=lambda: None,
+        max_tries=3,
+    )
+    assert out["email"] == "box2@outlook.com"
+    assert calls["marked"] == ["box1@outlook.com"]
+    miss = RuntimeError("Outlook RT 在 180s 内未收到验证码邮件")
+    assert should_count_as_failure(miss) is False
 
 
 def test_patchright_pre_inbox_retries_unspent_then_counts_spent():

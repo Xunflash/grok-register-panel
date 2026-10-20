@@ -33,6 +33,9 @@ def test_reusable_resource_error_is_not_counted_until_spent():
     cap = retry_policy.ReusableResourceError("paid", remote_captcha_used=True)
     assert retry_policy.should_count_as_failure(cap) is True
     assert retry_policy.should_count_as_failure(RuntimeError("other")) is True
+    assert retry_policy.should_count_as_failure(
+        RuntimeError("Outlook RT 在 180s 内未收到验证码邮件")
+    ) is False
     reset = ConnectionResetError(104, "Connection reset by peer")
     aborted = Exception("('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))")
     assert is_browser_pipe_error(reset) is True

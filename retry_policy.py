@@ -78,9 +78,17 @@ def retry_protocol_pre_inbox(
     raise ReusableResourceError(str(last_exc or "protocol pre-inbox failed"))
 
 
+def is_mailbox_code_miss(exc: BaseException | None) -> bool:
+    """Outlook/inbox never produced a code. Switch mailbox; do not count a failure."""
+    msg = str(exc or "")
+    return "未收到验证码" in msg or "收件箱为空" in msg
+
+
 def should_count_as_failure(exc: BaseException | None) -> bool:
     """Fail stats only after mailbox send-code or a paid remote captcha spend."""
     if exc is None:
+        return False
+    if is_mailbox_code_miss(exc):
         return False
     if getattr(exc, "email_used", False) or getattr(exc, "remote_captcha_used", False):
         return True
