@@ -165,6 +165,7 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     from nobrowser_protocol.cffi_engine import camoufox_imports
     from nobrowser_protocol.patchright_engine import (
         _castle_from_capture_or_mint,
+        _send_code_resend_allowed,
         _send_code_succeeded,
         camoufox_imports as pr_camoufox,
     )
@@ -232,6 +233,11 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_succeeded({"how": "page_otp_form"}) is True
     assert _send_code_succeeded({}, otp_visible=True) is True
     assert _send_code_succeeded({"how": "page_send_code_timeout"}, otp_visible=False) is False
+    assert _send_code_resend_allowed("") is True
+    assert _send_code_resend_allowed("account:email-signup-unavailable") is False
+    assert _send_code_resend_allowed("email:send-validation-code-rate-limited") is False
+    assert _send_code_resend_allowed("form-invalid:email:email") is False
+    assert _send_code_resend_allowed("account:missing-email") is True
     assert 'input[type="email"], input[name="email"]' not in sdk_text
     assert 'input[data-testid="email"]' in sdk_text
     assert "__reactProps$" in sdk_text
@@ -421,6 +427,73 @@ def test_patchright_panel_retries_existing_email_and_marks_used():
     assert "retry_patchright_mailboxes" in (
         ROOT / "signup_scheme.py"
     ).read_text(encoding="utf-8")
+
+
+def test_send_code_rejection_switches_exit_and_mailbox():
+    from nobrowser_protocol.patchright_engine import (
+        SendCodeSwitchError,
+        raise_send_code_rejection,
+    )
+    from signup_scheme import retry_patchright_mailboxes
+
+    for code in (
+        "account:email-signup-unavailable",
+        "email:send-validation-code-rate-limited",
+    ):
+        try:
+            raise_send_code_rejection(400, code, "a@outlook.com")
+        except SendCodeSwitchError as exc:
+            assert exc.code == code
+            assert exc.email == "a@outlook.com"
+        else:
+            raise AssertionError(code)
+    try:
+        raise_send_code_rejection(400, "account:email-domain-rejected", "a@outlook.com")
+    except RuntimeError as exc:
+        assert "account:email-domain-rejected" in str(exc)
+    else:
+        raise AssertionError("domain rejection stays a hard error")
+
+    calls = {"mail": 0, "marked": [], "rotated": 0}
+
+    def take_mailbox():
+        calls["mail"] += 1
+        return f"box{calls['mail']}@outlook.com", f"tok{calls['mail']}"
+
+    def signup(email, _token):
+        if email == "box1@outlook.com":
+            raise SendCodeSwitchError("account:email-signup-unavailable", email)
+        if email == "box2@outlook.com":
+            raise SendCodeSwitchError("email:send-validation-code-rate-limited", email)
+        return {
+            "email": email,
+            "sso": "sso",
+            "password": "pw",
+            "given_name": "A",
+            "family_name": "B",
+        }
+
+    def mark_used(email, reason="existing_email"):
+        calls["marked"].append((email, reason))
+
+    def rotate_exit():
+        calls["rotated"] += 1
+
+    out = retry_patchright_mailboxes(
+        take_mailbox=take_mailbox,
+        signup=signup,
+        mark_used=mark_used,
+        log=lambda _m: None,
+        cancel=lambda: None,
+        max_tries=3,
+        rotate_exit=rotate_exit,
+    )
+    assert out["email"] == "box3@outlook.com"
+    assert calls["rotated"] == 2
+    assert calls["marked"] == [
+        ("box1@outlook.com", "send_code_switch"),
+        ("box2@outlook.com", "send_code_switch"),
+    ]
 
 
 def test_outlook_code_miss_switches_mailbox_and_does_not_count():

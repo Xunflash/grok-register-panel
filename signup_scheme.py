@@ -107,20 +107,30 @@ def _load_patchright_signup() -> Callable[..., dict]:
     return _run_patchright_signup
 
 
+def _mark_mailbox(mark_used: Callable[..., None], email: str, reason: str) -> None:
+    try:
+        mark_used(email, reason=reason)
+    except TypeError:
+        mark_used(email)
+
+
 def retry_patchright_mailboxes(
     *,
     take_mailbox: Callable[[], tuple[str, str]],
     signup: Callable[[str, str], dict],
-    mark_used: Callable[[str], None],
+    mark_used: Callable[..., None],
     log: Callable[[str], Any],
     cancel: Callable[[], None],
     max_tries: int = 3,
+    rotate_exit: Callable[[], None] | None = None,
 ) -> dict:
-    """Take a new mailbox when create-account reports existingEmail; mark used."""
-    from nobrowser_protocol.patchright_engine import ExistingEmailError
+    """Switch mailbox after existingEmail, a missed code, or a rejected send."""
+    from nobrowser_protocol.patchright_engine import ExistingEmailError, SendCodeSwitchError
 
     last_existing = ""
     missed_code = False
+    switched_send = False
+    last_code = ""
     tries = max(1, int(max_tries or 3))
     for mail_try in range(1, tries + 1):
         cancel()
@@ -130,8 +140,17 @@ def retry_patchright_mailboxes(
             outcome = signup(email, mail_token)
         except ExistingEmailError as exc:
             last_existing = str(exc.email or email)
-            mark_used(last_existing)
+            _mark_mailbox(mark_used, last_existing, "existing_email")
             log(f"[!] existingEmail={last_existing}, retry another mailbox")
+            continue
+        except SendCodeSwitchError as exc:
+            switched_send = True
+            last_code = str(exc.code or "")
+            last_existing = str(exc.email or email)
+            _mark_mailbox(mark_used, last_existing, "send_code_switch")
+            log(f"[!] send-code {last_code}，换出口和邮箱重试")
+            if mail_try < tries and callable(rotate_exit):
+                rotate_exit()
             continue
         except Exception as exc:
             from retry_policy import is_mailbox_code_miss
@@ -141,7 +160,7 @@ def retry_patchright_mailboxes(
             missed_code = True
             last_existing = email
             try:
-                mark_used(email)
+                _mark_mailbox(mark_used, email, "code_miss")
             except Exception:
                 pass
             log(f"[!] 验证码未到，换邮箱重试（不计失败）: {exc}")
@@ -149,8 +168,12 @@ def retry_patchright_mailboxes(
         if not isinstance(outcome, dict) or not outcome.get("sso"):
             raise RuntimeError("patchright signup returned no sso")
         return outcome
-    if missed_code:
+    if missed_code and not switched_send:
         raise RuntimeError(f"未收到验证码，已换 {tries} 个邮箱 last={last_existing}")
+    if switched_send:
+        raise RuntimeError(
+            f"send-code {last_code}，已换 {tries} 个出口和邮箱 last={last_existing}"
+        )
     raise RuntimeError(f"existingEmail after mailbox retries last={last_existing}")
 
 
@@ -222,7 +245,12 @@ def _run_patchright_signup(
     har = load_har(har_path)
 
     def _once(usage) -> dict:
-        proxy = get_bound_proxy()
+        from grok_register_ttk import get_thread_proxy
+
+        def _proxy_now() -> str:
+            return str(get_thread_proxy() or get_bound_proxy() or "")
+
+        proxy_box = {"url": _proxy_now()}
 
         def signup(email: str, mail_token: str) -> dict:
             def wait_otp(_after_ts: float, _email=email, _token=mail_token) -> str:
@@ -243,16 +271,20 @@ def _run_patchright_signup(
                     cancel=_cancel,
                 )
 
+            from nobrowser_protocol.patchright_engine import SendCodeSwitchError
+
             try:
                 return signup_with_patchright(
                     har=har,
-                    proxy=proxy,
+                    proxy=proxy_box["url"],
                     email=email,
                     wait_otp=wait_otp,
                     solve_ts=solve_ts,
                     log=emit,
                     usage=usage,
                 )
+            except SendCodeSwitchError:
+                raise
             except Exception:
                 if not getattr(usage, "email_used", False) and not getattr(
                     usage, "remote_captcha_used", False
@@ -263,10 +295,19 @@ def _run_patchright_signup(
                         pass
                 raise
 
-        def mark_used(email: str) -> None:
+        def mark_used(email: str, reason: str = "existing_email") -> None:
             if usage is not None:
                 usage.email_used = True
-            mark_outlook_rt_used(email, reason="existing_email", log_callback=emit)
+            mark_outlook_rt_used(email, reason=reason, log_callback=emit)
+
+        def rotate_exit() -> None:
+            from browser_session import set_exit_context
+
+            recycle_patchright_exit(emit)
+            nxt = _proxy_now()
+            if nxt:
+                set_exit_context(proxy=nxt, exit_ip="")
+            proxy_box["url"] = nxt
 
         return retry_patchright_mailboxes(
             take_mailbox=get_email_and_token,
@@ -275,6 +316,7 @@ def _run_patchright_signup(
             log=emit,
             cancel=_cancel,
             max_tries=3,
+            rotate_exit=rotate_exit,
         )
 
     outcome = run_patchright_pre_inbox(

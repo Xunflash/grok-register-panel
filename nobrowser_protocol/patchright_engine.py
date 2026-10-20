@@ -507,6 +507,52 @@ def _await_send_status(captured: dict, timeout: float = 8.0) -> int:
         return 0
 
 
+_NO_RESEND_SEND_CODES = frozenset(
+    {
+        "account:email-signup-unavailable",
+        "account:email-in-use",
+        "account:email-malformed",
+        "account:email-domain-rejected",
+        "account:email-domain-pending",
+        "email:send-validation-code-rate-limited",
+        "rate-limit:too-many-requests",
+    }
+)
+_SWITCH_EXIT_MAILBOX_CODES = frozenset(
+    {
+        "account:email-signup-unavailable",
+        "email:send-validation-code-rate-limited",
+    }
+)
+
+
+class SendCodeSwitchError(Exception):
+    """x.ai rejected send-code. Caller switches exit and mailbox."""
+
+    def __init__(self, code: str, email: str = "") -> None:
+        self.code = str(code or "").strip()
+        self.email = str(email or "").strip()
+        super().__init__(f"send-code {self.code}")
+
+
+def raise_send_code_rejection(status: object, error_code: str, email: str = "") -> None:
+    code = str(error_code or "").strip()
+    if code in _SWITCH_EXIT_MAILBOX_CODES:
+        raise SendCodeSwitchError(code, email)
+    detail = f" code={code}" if code else ""
+    raise RuntimeError(f"send-code not accepted status={status}{detail}")
+
+
+def _send_code_resend_allowed(error_code: str) -> bool:
+    """Immediate Sign up clicks do not clear a terminal or rate-limit rejection."""
+    code = str(error_code or "").strip()
+    if not code:
+        return True
+    if code.startswith("form-invalid:"):
+        return False
+    return code not in _NO_RESEND_SEND_CODES
+
+
 def _resend_verification_code(
     page,
     captured: dict,
@@ -537,6 +583,10 @@ def _resend_verification_code(
             captured["send_status"] = previous
         log(f"send-code resend {attempt}/3 status={status}")
         if 200 <= status < 300:
+            return status
+        error_code = str(captured.get("send_error") or "")
+        if error_code and not _send_code_resend_allowed(error_code):
+            log(f"send-code resend {attempt}/3 stop code={error_code}")
             return status
     try:
         return int(captured.get("send_status") or 0)
@@ -746,12 +796,21 @@ def signup_with_patchright(
                 status = _await_send_status(captured) if not accepted else int(captured.get("send_status") or 0)
                 emit(f"send-code response status={status or 'unconfirmed'}")
                 if not accepted and not (200 <= status < 300):
+                    error_code = str(captured.get("send_error") or "")
+                    if error_code and not _send_code_resend_allowed(error_code):
+                        raise_send_code_rejection(status or "missing", error_code, email)
                     emit(f"send-code not accepted status={status or 'missing'}; resend")
                     status = _resend_verification_code(page, captured, emit, email)
                     sent_at = time.time()
                     accepted = 200 <= status < 300 or _otp_visible(page)
                 if not accepted:
-                    raise RuntimeError(f"send-code not accepted status={status} after 3 resends")
+                    error_code = str(captured.get("send_error") or "")
+                    if error_code in _SWITCH_EXIT_MAILBOX_CODES:
+                        raise SendCodeSwitchError(error_code, email)
+                    detail = f" code={error_code}" if error_code else ""
+                    raise RuntimeError(
+                        f"send-code not accepted status={status} after 3 resends{detail}"
+                    )
                 if usage is not None:
                     usage.email_used = True
                 emit("send-code accepted")
