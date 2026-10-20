@@ -527,7 +527,7 @@ def _capture_send_code(
     return captured
 
 
-def _await_send_status(captured: dict, timeout: float = 8.0) -> int:
+def _await_send_status(captured: dict, timeout: float = 30.0) -> int:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

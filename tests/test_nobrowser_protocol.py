@@ -446,6 +446,7 @@ def test_har_signup_order_and_request_shapes():
         GROK_SIGNUP_URL,
         HAR_SIGNUP_QUERY_KEYS,
         _accounts_signup_url,
+        _await_send_status,
         _otp_for_page,
         har_signup_navigation,
         preamble_ready,
@@ -490,6 +491,9 @@ def test_har_signup_order_and_request_shapes():
         "turnstileToken",
     }
     assert create["json"]["emailValidationCode"] == "123456"
+    import inspect
+
+    assert inspect.signature(_await_send_status).parameters["timeout"].default >= 20
     assert preamble_ready({"turnstile": True, "cookie": True, "sign_in": True})
     assert not preamble_ready({"turnstile": True, "sign_in": True})
     fixture = json.loads(
