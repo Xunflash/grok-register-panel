@@ -765,11 +765,17 @@ def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
 
 
 def _open_signup_page(page, log: Callable[[str], None]) -> None:
-    """Match the manual entry: grok.com/sign-up, then accounts sign-up, then cookie-chain."""
+    """Match the manual entry: grok sign-up, cookie-chain, then the accounts form."""
     try:
         page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
     except Exception as exc:
         log(f"grok.com/sign-up: {exc}")
+    try:
+        page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        log(f"cookie-chain open: {exc}")
+    _wait_cookie_chain(page, log, timeout=40, grace=8)
+    log(f"after cookie-chain url={str(getattr(page, 'url', '') or '')[:180]}")
     _goto_accounts_signup(page, log)
     log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
     _wait_cookie_chain(page, log)
