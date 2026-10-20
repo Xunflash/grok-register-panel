@@ -764,26 +764,63 @@ def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
     )
 
 
+def _note_send_preamble(flags: dict, request) -> None:
+    """Record the requests the HAR shows on the sign-up document before send-code."""
+    url = str(getattr(request, "url", "") or "")
+    path = url.split("?", 1)[0]
+    if "/turnstile/" in url and "api.js" in url:
+        flags["turnstile"] = True
+    if "set-cookie" in path or "delete-cookie" in path:
+        flags["cookie"] = True
+    if path.rstrip("/").endswith("/sign-in") and "accounts.x.ai" in path:
+        flags["sign_in"] = True
+
+
+def _wait_send_preamble(page, flags: dict, log: Callable[[str], None], timeout: float = 25.0) -> None:
+    """Stay on the sign-up document until Turnstile and the sign-in/set-cookie prelude finish."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if flags.get("turnstile") and (flags.get("cookie") or flags.get("sign_in")):
+            break
+        page.wait_for_timeout(250)
+    log(
+        "send preamble "
+        f"turnstile={bool(flags.get('turnstile'))} "
+        f"set_cookie={bool(flags.get('cookie'))} "
+        f"sign_in={bool(flags.get('sign_in'))}"
+    )
+
+
 def _open_signup_page(page, log: Callable[[str], None]) -> None:
-    """Match the manual entry: grok sign-up, cookie-chain, then the accounts form."""
+    """Match the manual HAR: cookie-chain, grok.com/sign-up, then stay on accounts sign-up."""
+    preamble: dict[str, bool] = {}
+
+    def on_request(request):
+        _note_send_preamble(preamble, request)
+
+    page.on("request", on_request)
     try:
-        page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
-    except Exception as exc:
-        log(f"grok.com/sign-up: {exc}")
-    try:
-        page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
-    except Exception as exc:
-        log(f"cookie-chain open: {exc}")
-    _wait_cookie_chain(page, log, timeout=40, grace=8)
-    log(f"after cookie-chain url={str(getattr(page, 'url', '') or '')[:180]}")
-    _goto_accounts_signup(page, log)
-    log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
-    _wait_cookie_chain(page, log)
-    if _chrome_error_navigation(getattr(page, "url", "")) or "sign-up" not in str(
-        getattr(page, "url", "") or ""
-    ):
+        try:
+            page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            log(f"cookie-chain open: {exc}")
+        _wait_cookie_chain(page, log, timeout=40, grace=8)
+        log(f"after cookie-chain url={str(getattr(page, 'url', '') or '')[:180]}")
+        try:
+            page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
+        except Exception as exc:
+            log(f"grok.com/sign-up: {exc}")
         _goto_accounts_signup(page, log)
-        _wait_cookie_chain(page, log, grace=2.0)
+        log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
+        _wait_send_preamble(page, preamble, log)
+        if _chrome_error_navigation(getattr(page, "url", "")):
+            _goto_accounts_signup(page, log)
+            _wait_send_preamble(page, preamble, log, timeout=15)
+    finally:
+        try:
+            page.remove_listener("request", on_request)
+        except Exception:
+            pass
 
 
 def _await_flag(captured: dict, key: str, timeout: float = 20.0) -> int:

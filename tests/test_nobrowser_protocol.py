@@ -250,6 +250,10 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "no-visible-email" in sdk_text
     assert "EMAIL_INPUT_SELECTOR" in engine_text
     assert "https://grok.com/sign-up" in engine_text
+    open_fn = engine_text.split("def _note_send_preamble", 1)[1].split("def _await_flag", 1)[0]
+    assert open_fn.index("/cookie-chain") < open_fn.index("GROK_SIGNUP_URL")
+    assert "api.js" in open_fn
+    assert "/sign-in" in open_fn
     assert "analytics_consent=true" in engine_text
     assert "advertising_consent=true" in engine_text
     assert "mwbv=true" in engine_text
