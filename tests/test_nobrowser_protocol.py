@@ -232,6 +232,15 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_succeeded({"how": "page_otp_form"}) is True
     assert _send_code_succeeded({}, otp_visible=True) is True
     assert _send_code_succeeded({"how": "page_send_code_timeout"}, otp_visible=False) is False
+    assert 'input[type="email"], input[name="email"]' not in sdk_text
+    assert 'input[data-testid="email"]' in sdk_text
+    assert "__reactProps$" in sdk_text
+    assert "autocomplete') || '').toLowerCase()" in sdk_text
+    assert "no-visible-email" in sdk_text
+    assert "EMAIL_INPUT_SELECTOR" in engine_text
+    assert '_resend_verification_code(page, captured, emit, email)' in engine_text
+    assert "send-code resend" in engine_text
+    assert "skipped submit; email field empty" in engine_text
 
 
 def test_signup_with_patchright_reaches_browser_without_outlook_min():

@@ -149,31 +149,102 @@ CLICK_VISIBLE_JS = """
 
 FILL_EMAIL_JS = """
 (email) => {
-  const input = document.querySelector('input[type="email"], input[name="email"], input[data-testid="email"], input[autocomplete="email"]');
-  if (!input) return { ok: false, reason: 'no-input' };
+  const visible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const auto = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (auto === 'username') return false;
+    if (el.closest('[hidden]')) return false;
+    const cls = String(el.className || '');
+    if (/(^|\\s)hidden(\\s|$)/.test(cls)) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const input = Array.from(document.querySelectorAll(
+    '#email, input[data-testid="email"], input[autocomplete="email"]'
+  )).find(visible);
+  if (!input) return { ok: false, reason: 'no-visible-email' };
+  const value = String(email || '');
   input.focus();
-  input.click();
-  const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
-  const tracker = input._valueTracker;
-  if (tracker) tracker.setValue('');
-  if (setter) setter.call(input, email); else input.value = email;
-  input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-  input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-  input.blur();
-  const valid = (input.getAttribute('type') || '').toLowerCase() !== 'email' || input.checkValidity();
-  return { ok: (input.value || '') === email && valid, value: input.value || '', valid };
+  const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+  const setter = desc && desc.set;
+  const write = (next) => {
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue(input.value);
+    if (setter) setter.call(input, next);
+    else input.value = next;
+  };
+  const reactKey = Object.keys(input).find((k) => k.startsWith('__reactProps$'));
+  const props = reactKey ? input[reactKey] : null;
+  const emit = (next) => {
+    write(next);
+    const native = new InputEvent('input', {
+      bubbles: true,
+      cancelable: true,
+      data: next,
+      inputType: next ? 'insertText' : 'deleteContentBackward',
+    });
+    const synthetic = {
+      target: input,
+      currentTarget: input,
+      nativeEvent: native,
+      preventDefault() {},
+      stopPropagation() {},
+      isDefaultPrevented() { return false; },
+      isPropagationStopped() { return false; },
+    };
+    if (props && typeof props.onChange === 'function') props.onChange(synthetic);
+    else input.dispatchEvent(native);
+  };
+  emit('');
+  emit(value);
+  const blur = {
+    target: input,
+    currentTarget: input,
+    nativeEvent: new FocusEvent('blur'),
+    preventDefault() {},
+    stopPropagation() {},
+  };
+  if (props && typeof props.onBlur === 'function') props.onBlur(blur);
+  else {
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.blur();
+  }
+  return {
+    ok: (input.value || '') === value && value.length > 0,
+    value: input.value || '',
+    id: input.id || '',
+    name: input.getAttribute('name') || '',
+    auto: input.getAttribute('autocomplete') || '',
+  };
 }
 """
 
 SUBMIT_EMAIL_JS = """
 () => {
+  const visible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const auto = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (auto === 'username') return false;
+    if (el.closest('[hidden]')) return false;
+    const cls = String(el.className || '');
+    if (/(^|\\s)hidden(\\s|$)/.test(cls)) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const input = Array.from(document.querySelectorAll(
+    '#email, input[data-testid="email"], input[autocomplete="email"]'
+  )).find(visible) || null;
   const deny = /with email|with apple|with google|with x\\b|使用邮箱|correo|regresar|privacidad|go back|privacy/i;
-  const input = document.querySelector('input[type="email"], input[name="email"], input[data-testid="email"], input[autocomplete="email"]');
-  const nodes = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'));
+  const form = input ? input.closest('form') : null;
+  const root = form || document;
+  const nodes = Array.from(root.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'));
   const hit = nodes.find((n) => {
     if (n.disabled || n.getAttribute('aria-disabled') === 'true') return false;
+    if (!visible(n) && n.getAttribute('type') !== 'submit') return false;
     const t = ((n.innerText || n.textContent || n.value || '') + '').replace(/\\s+/g, ' ').trim();
     const testid = (n.getAttribute('data-testid') || '').toLowerCase();
     const type = (n.getAttribute('type') || '').toLowerCase();
@@ -188,21 +259,12 @@ SUBMIT_EMAIL_JS = """
     hit.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
     hit.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
     hit.click();
+    return ((hit.innerText || hit.getAttribute('data-testid') || 'clicked') + '').replace(/\\s+/g, ' ').trim().slice(0, 80);
   }
-  const form = (input && input.closest('form')) || document.querySelector('form');
-  if (form) {
-    if (typeof form.requestSubmit === 'function') {
-      try { form.requestSubmit(hit || undefined); } catch (e) { try { form.requestSubmit(); } catch (e2) {} }
-    } else {
-      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    }
+  if (form && typeof form.requestSubmit === 'function') {
+    try { form.requestSubmit(); return 'form-submit'; } catch (e) {}
   }
-  if (input) {
-    input.focus();
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-  }
-  return hit ? ((hit.innerText || hit.getAttribute('data-testid') || 'clicked') + '').replace(/\\s+/g, ' ').trim().slice(0, 80) : (form ? 'form-submit' : 'enter');
+  return input ? 'no-submit' : 'no-visible-email';
 }
 """
 

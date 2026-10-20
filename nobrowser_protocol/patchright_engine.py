@@ -269,6 +269,10 @@ def _capture_auth_headers(captured: dict[str, Any], request) -> None:
     if AUTH_SEND_CODE in url:
         captured["json"] = body or captured.get("json") or {}
         captured["url"] = url
+        posted = str(body.get("email") or "")
+        expect = str(captured.get("expect_email") or "")
+        captured["send_email_len"] = len(posted)
+        captured["send_email_match"] = bool(expect) and posted == expect
     if AUTH_VERIFY_EMAIL in url:
         captured["verify_json"] = body
     if AUTH_CREATE_ACCOUNT in url:
@@ -370,6 +374,35 @@ def _castle_from_capture_or_mint(captured: dict | None, minted: dict | None) -> 
     }
 
 
+EMAIL_INPUT_SELECTOR = (
+    '#email:not([readonly]):visible, '
+    'input[data-testid="email"]:not([readonly]):visible, '
+    'input[autocomplete="email"]:not([readonly]):visible'
+)
+
+
+def _fill_signup_email(page, email: str, log: Callable[[str], None]) -> dict:
+    """Write the address into the visible email-step field and its React state."""
+    try:
+        loc = page.locator(EMAIL_INPUT_SELECTOR).first
+        loc.wait_for(state="visible", timeout=20000)
+        loc.fill(email, timeout=8000)
+    except Exception as exc:
+        log(f"locator fill: {exc}")
+    try:
+        result = page.evaluate(FILL_EMAIL_JS, email) or {}
+    except Exception as exc:
+        log(f"react fill: {exc}")
+        result = {"ok": False, "reason": str(exc)[:160]}
+    if not isinstance(result, dict):
+        result = {"ok": False, "reason": "bad-result"}
+    log(
+        f"email fill ok={bool(result.get('ok'))} id={result.get('id')!r} "
+        f"auto={result.get('auto')!r} len={len(str(result.get('value') or ''))}"
+    )
+    return result
+
+
 def _capture_send_code(
     page,
     email: str,
@@ -379,9 +412,16 @@ def _capture_send_code(
 ) -> dict:
     """Let the live page SDK fire send-code; capture castleRequestToken from that XHR."""
     captured = captured if captured is not None else {}
+    captured["expect_email"] = email
 
     def on_request(request):
         _capture_auth_headers(captured, request)
+        url = str(request.url or "")
+        if AUTH_SEND_CODE in url and str(request.method or "").upper() == "POST":
+            log(
+                f"send-code request email_len={captured.get('send_email_len')} "
+                f"match={captured.get('send_email_match')}"
+            )
 
     def on_response(response):
         try:
@@ -390,7 +430,19 @@ def _capture_send_code(
             if str(getattr(response.request, "method", "") or "").upper() != "POST":
                 return
             captured["send_status"] = int(response.status)
-            log(f"send-code response status={response.status}")
+            code = ""
+            if int(response.status) >= 400:
+                try:
+                    data = response.json()
+                except Exception:
+                    data = None
+                if isinstance(data, dict):
+                    code = str(data.get("code") or data.get("error") or "")[:120]
+                    captured["send_error"] = code
+            if code:
+                log(f"send-code response status={response.status} code={code}")
+            else:
+                log(f"send-code response status={response.status}")
         except Exception as exc:
             log(f"send-code response read: {exc}")
 
@@ -398,32 +450,14 @@ def _capture_send_code(
     page.on("response", on_response)
     try:
         _open_email_form(page, log)
-        loc = page.locator(
-            'input[type="email"], input[name="email"], input[data-testid="email"], input[autocomplete="email"]'
-        ).first
-        loc.wait_for(state="visible", timeout=20000)
-        filled = False
-        try:
-            loc.fill(email, timeout=8000)
-            filled = True
-        except Exception as exc:
-            log(f"locator fill: {exc}")
-        if not filled:
-            react = page.evaluate(FILL_EMAIL_JS, email)
-            log(f"react fill={react!r}")
+        filled = _fill_signup_email(page, email, log)
         clicked = ""
-        try:
-            submit = page.locator('button[type="submit"]').first
-            if submit.count() > 0:
-                submit.wait_for(state="visible", timeout=3000)
-                clicked = str(submit.inner_text(timeout=1000) or "submit")
-                submit.click(timeout=5000)
-        except Exception:
-            clicked = ""
-        if not clicked:
-            clicked = _click_first(page, SUBMIT_NEEDLES, timeout=5000, deny=SUBMIT_DENY)
-        if not clicked:
-            clicked = str(page.evaluate(SUBMIT_EMAIL_JS) or "js-submit")
+        if filled.get("ok"):
+            clicked = str(page.evaluate(SUBMIT_EMAIL_JS) or "")
+            if clicked in {"", "no-submit", "no-visible-email"}:
+                clicked = _click_first(page, SUBMIT_NEEDLES, timeout=5000, deny=SUBMIT_DENY)
+        else:
+            log("email fill missed; skip submit")
         log(f"email submit click={clicked!r}")
     except Exception as exc:
         log(f"page fill/submit: {exc}")
@@ -473,19 +507,29 @@ def _await_send_status(captured: dict, timeout: float = 8.0) -> int:
         return 0
 
 
-def _resend_verification_code(page, captured: dict, log: Callable[[str], None]) -> int:
-    """Click resend up to three times until send-verification-code returns 2xx."""
+def _resend_verification_code(
+    page,
+    captured: dict,
+    log: Callable[[str], None],
+    email: str,
+) -> int:
+    """Retry a rejected send. OTP step clicks Resend; email step refills then submits."""
     for attempt in range(1, 4):
         previous = int(captured.get("send_status") or 0)
         captured["send_status"] = 0
-        clicked = _click_first(
-            page,
-            ("Resend code", "Resend", "Send again", "Send code", "重新发送", "重发"),
-            timeout=4000,
-            deny=("privacy", "with email"),
-        )
-        if not clicked:
-            clicked = _click_first(page, SUBMIT_NEEDLES, timeout=4000, deny=SUBMIT_DENY)
+        if _otp_visible(page):
+            clicked = _click_first(
+                page,
+                ("Resend code", "Resend", "Send again", "Send code", "重新发送", "重发"),
+                timeout=4000,
+                deny=("privacy", "with email", "sign up"),
+            )
+        else:
+            filled = _fill_signup_email(page, email, log)
+            if not filled.get("ok"):
+                log(f"send-code resend {attempt}/3 skipped submit; email field empty")
+                continue
+            clicked = str(page.evaluate(SUBMIT_EMAIL_JS) or "")
         log(f"send-code resend {attempt}/3 click={clicked!r}")
         status = _await_send_status(captured, timeout=12.0)
         if not status:
@@ -636,7 +680,7 @@ def signup_with_patchright(
             launch_kw["executable_path"] = chrome
         context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
         browser = context.browser
-        net: dict[str, Any] = {}
+        net: dict[str, Any] = {"expect_email": email}
 
         def on_request(request):
             _capture_auth_headers(net, request)
@@ -703,7 +747,7 @@ def signup_with_patchright(
                 emit(f"send-code response status={status or 'unconfirmed'}")
                 if not accepted and not (200 <= status < 300):
                     emit(f"send-code not accepted status={status or 'missing'}; resend")
-                    status = _resend_verification_code(page, captured, emit)
+                    status = _resend_verification_code(page, captured, emit, email)
                     sent_at = time.time()
                     accepted = 200 <= status < 300 or _otp_visible(page)
                 if not accepted:
