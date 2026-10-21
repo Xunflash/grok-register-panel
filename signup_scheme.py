@@ -248,7 +248,12 @@ def _run_patchright_signup(
         from grok_register_ttk import get_thread_proxy
 
         def _proxy_now() -> str:
-            return str(get_thread_proxy() or get_bound_proxy() or "")
+            raw = str(get_thread_proxy() or get_bound_proxy() or "")
+            if not raw:
+                return ""
+            from batch_traffic import meter_proxy_url
+
+            return meter_proxy_url(raw)
 
         proxy_box = {"url": _proxy_now()}
 

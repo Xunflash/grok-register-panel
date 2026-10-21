@@ -165,6 +165,7 @@ def test_loader_source_imports_shipped_protocol_entry():
     text = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
     assert "from protocol_register_once import run_protocol_signup" in text
     assert "signup_with_patchright" in text
+    assert "meter_proxy_url" in text
     assert "SCHEME_PROTOCOL_PATCHRIGHT" in text
     proto = (ROOT / "protocol_register_once.py").read_text(encoding="utf-8")
     assert "def run_protocol_signup(" in proto
