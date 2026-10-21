@@ -238,6 +238,12 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert _send_code_resend_allowed("email:send-validation-code-rate-limited") is False
     assert _send_code_resend_allowed("form-invalid:email:email") is False
     assert _send_code_resend_allowed("account:missing-email") is True
+    from nobrowser_protocol.patchright_engine import send_code_already_accepted
+
+    assert send_code_already_accepted(200) is True
+    assert send_code_already_accepted(0) is False
+    assert send_code_already_accepted(0, otp_visible=True) is True
+    assert send_code_already_accepted(400) is False
     from nobrowser_protocol.patchright_engine import _accounts_signup_url, _otp_for_page, preamble_ready
 
     assert _otp_for_page("123-456") == "123456"
@@ -286,10 +292,13 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     assert "no-visible-email" in sdk_text
     assert "EMAIL_INPUT_SELECTOR" in engine_text
     assert "https://grok.com/sign-up" in engine_text
-    open_fn = engine_text.split("def _note_send_preamble", 1)[1].split("def _await_flag", 1)[0]
-    assert open_fn.index("/cookie-chain") < open_fn.index("GROK_SIGNUP_URL")
-    assert "api.js" in open_fn
-    assert "/sign-in" in open_fn
+    open_fn = engine_text.split("def _open_signup_page", 1)[1].split("def _query_keys", 1)[0]
+    assert "_goto_accounts_signup" in open_fn
+    assert "/sign-out" not in open_fn
+    assert "/cookie-chain" not in open_fn
+    assert "GROK_SIGNUP_URL" not in open_fn
+    assert "api.js" in engine_text
+    assert "/sign-in" in engine_text
     assert "analytics_consent=true" in engine_text
     assert "advertising_consent=true" in engine_text
     assert "mwbv=true" in engine_text
@@ -435,6 +444,80 @@ def test_existing_email_payload_and_engine_raises():
     err = ExistingEmailError("a@b.c", {"existingEmail": True, "signInMethods": ["p"]})
     assert err.email == "a@b.c"
     assert "existingEmail=a@b.c" in str(err)
+
+
+def test_castle_worker_timeout_is_extended():
+    from nobrowser_protocol.patchright_engine import extend_castle_worker_timeout
+
+    source = "before r[9]=r[8]?mN:mJ after r[9]=r[8]?mN:mJ f[20]=setTimeout(function(){f[10]=!0,f[15]()},f[21])"
+    patched = extend_castle_worker_timeout(source)
+    assert "r[9]=20000" in patched
+    assert patched.count("r[9]=r[8]?mN:mJ") == 1
+    assert "f[15]()},20000)" in patched
+    assert extend_castle_worker_timeout("unchanged") == "unchanged"
+
+
+def test_signup_events_run_before_email_fill():
+    """Castle event playback is part of the page send path and survives a short run."""
+    from nobrowser_protocol.patchright_engine import _play_signup_events
+
+    class _Mouse:
+        def move(self, x, y, steps=1):
+            self.moves.append((x, y, steps))
+
+        def down(self):
+            self.presses += 1
+
+        def up(self):
+            self.presses += 1
+
+        moves = []
+        presses = 0
+
+    class _Page:
+        mouse = _Mouse()
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+        waits = []
+
+    logs = []
+    page = _Page()
+    _play_signup_events(page, logs.append, rounds=2)
+    assert page.mouse.moves
+    assert any(ms > 1000 for ms in page.waits)
+    assert any(line.startswith("castle events rounds=2") for line in logs)
+
+
+def test_headless_signup_borrows_headed_clearance():
+    import inspect
+
+    from nobrowser_protocol.patchright_engine import (
+        _harvest_headed_clearance,
+        signup_with_patchright,
+    )
+
+    harvest = inspect.getsource(_harvest_headed_clearance)
+    signup = inspect.getsource(signup_with_patchright)
+    assert "cf_clearance" in harvest
+    assert "navigator.userAgent" in harvest
+    assert "cookie.get(\"value\")" not in harvest
+    assert "if not headed:" in signup
+    assert "_harvest_headed_clearance" in signup
+
+
+def test_open_signup_goes_directly_to_long_accounts_url():
+    import inspect
+
+    from nobrowser_protocol.patchright_engine import _open_signup_page
+
+    src = inspect.getsource(_open_signup_page)
+    assert "_goto_accounts_signup" in src
+    assert "/sign-out" not in src
+    assert "/cookie-chain" not in src
+    assert "GROK_HOME_URL" not in src
+    assert "GROK_SIGNUP_URL" not in src
 
 
 def test_har_signup_order_and_request_shapes():

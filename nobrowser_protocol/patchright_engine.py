@@ -414,6 +414,73 @@ EMAIL_INPUT_SELECTOR = (
 )
 
 
+_CASTLE_WORKER_TIMEOUT = "r[9]=r[8]?mN:mJ"
+_CASTLE_WORKER_TIMEOUT_MS = "r[9]=20000"
+
+
+_CASTLE_PLATFORM_WORKER_TIMEOUT = "f[20]=setTimeout(function(){f[10]=!0,f[15]()},f[21])"
+_CASTLE_PLATFORM_WORKER_TIMEOUT_MS = "f[20]=setTimeout(function(){f[10]=!0,f[15]()},20000)"
+
+
+def extend_castle_worker_timeout(source: str) -> str:
+    """Let Castle's workers finish. Both otherwise give up after 1.5s."""
+    if _CASTLE_WORKER_TIMEOUT in source:
+        source = source.replace(_CASTLE_WORKER_TIMEOUT, _CASTLE_WORKER_TIMEOUT_MS, 1)
+    if _CASTLE_PLATFORM_WORKER_TIMEOUT in source:
+        source = source.replace(_CASTLE_PLATFORM_WORKER_TIMEOUT, _CASTLE_PLATFORM_WORKER_TIMEOUT_MS, 1)
+    return source
+
+
+def _keep_castle_worker(context, log: Callable[[str], None]) -> None:
+    def handle(route):
+        try:
+            response = route.fetch()
+            body = response.text()
+        except Exception as exc:
+            log(f"castle worker fetch: {exc}")
+            route.continue_()
+            return
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in {"content-length", "content-encoding"}
+        }
+        patched = extend_castle_worker_timeout(body)
+        if patched != body:
+            log("castle worker wait=20000")
+        route.fulfill(status=response.status, headers=headers, body=patched)
+
+    context.route("**/*02bh2mv7efkj1.js*", handle)
+
+
+def _play_signup_events(page, log: Callable[[str], None], rounds: int = 1) -> None:
+    """Pointer moves and >1s pauses so the page Castle SDK records events before mint."""
+    raw_rounds = str(os.environ.get("CASTLE_EVENT_ROUNDS") or "").strip()
+    if raw_rounds:
+        try:
+            rounds = max(1, min(24, int(raw_rounds)))
+        except ValueError:
+            pass
+    started = time.time()
+    try:
+        # Repeated keys on one input are collapsed. Different gestures with
+        # pauses over 1s each add a gap record to the castle event log.
+        for i in range(rounds):
+            page.mouse.move(160 + (i * 70) % 800, 140 + (i % 5) * 60, steps=12)
+            page.mouse.down()
+            page.mouse.up()
+            page.wait_for_timeout(1200)
+        try:
+            page.keyboard.press("Tab")
+            page.wait_for_timeout(1200)
+        except Exception as exc:
+            log(f"castle events key: {exc}")
+        page.mouse.move(48, 48)
+        log(f"castle events rounds={rounds} ms={int((time.time() - started) * 1000)}")
+    except Exception as exc:
+        log(f"castle events: {exc}")
+
+
 def _fill_signup_email(page, email: str, log: Callable[[str], None]) -> dict:
     """Type the address the way the HAR session did, then sync React state."""
     try:
@@ -421,7 +488,10 @@ def _fill_signup_email(page, email: str, log: Callable[[str], None]) -> dict:
         loc.wait_for(state="visible", timeout=20000)
         loc.click(timeout=3000)
         loc.fill("", timeout=3000)
-        loc.press_sequentially(email, delay=70)
+        split = max(1, len(email) // 2)
+        loc.press_sequentially(email[:split], delay=90)
+        page.wait_for_timeout(1200)
+        loc.press_sequentially(email[split:], delay=90)
     except Exception as exc:
         log(f"locator fill: {exc}")
     try:
@@ -486,6 +556,7 @@ def _capture_send_code(
     page.on("response", on_response)
     try:
         _open_email_form(page, log)
+        _play_signup_events(page, log)
         filled = _fill_signup_email(page, email, log)
         clicked = ""
         if filled.get("ok"):
@@ -579,6 +650,17 @@ def raise_send_code_rejection(status: object, error_code: str, email: str = "") 
     raise RuntimeError(f"send-code not accepted status={status}{detail}")
 
 
+def send_code_already_accepted(status: object, otp_visible: bool = False) -> bool:
+    """A late 2xx or a visible OTP form means the code was sent. Do not click Resend."""
+    if otp_visible:
+        return True
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    return 200 <= code < 300
+
+
 def _send_code_resend_allowed(error_code: str) -> bool:
     """Immediate Sign up clicks do not clear a terminal or rate-limit rejection."""
     code = str(error_code or "").strip()
@@ -596,8 +678,16 @@ def _resend_verification_code(
     email: str,
 ) -> int:
     """Retry a rejected send. OTP step clicks Resend; email step refills then submits."""
+    already = int(captured.get("send_status") or 0)
+    if send_code_already_accepted(already, _otp_visible(page)):
+        log(f"send-code already accepted status={already or 200}; skip resend")
+        return already or 200
     for attempt in range(1, 4):
-        previous = int(captured.get("send_status") or 0)
+        already = int(captured.get("send_status") or 0)
+        if send_code_already_accepted(already, _otp_visible(page)):
+            log(f"send-code already accepted status={already or 200}; skip resend")
+            return already or 200
+        previous = already
         captured["send_status"] = 0
         if _otp_visible(page):
             clicked = _click_first(
@@ -768,7 +858,12 @@ def _goto_accounts_signup(page, log: Callable[[str], None]) -> None:
     target = _accounts_signup_url()
     for attempt in range(1, 4):
         try:
-            page.goto(target, wait_until="domcontentloaded", timeout=45000)
+            page.goto(
+                target,
+                wait_until="domcontentloaded",
+                timeout=45000,
+                referer=GROK_HOME_URL,
+            )
         except Exception as exc:
             last = str(exc)
             log(f"sign-up goto {attempt}/3: {exc}")
@@ -823,7 +918,7 @@ def _wait_send_preamble(page, flags: dict, log: Callable[[str], None], timeout: 
 
 
 def _open_signup_page(page, log: Callable[[str], None]) -> None:
-    """HAR order: grok.com, sign-out into cookie-chain?q=, grok sign-up, stay on accounts sign-up."""
+    """Open the long accounts sign-up URL directly, with grok.com as referer."""
     preamble: dict[str, bool] = {}
 
     def on_request(request):
@@ -831,32 +926,7 @@ def _open_signup_page(page, log: Callable[[str], None]) -> None:
 
     page.on("request", on_request)
     try:
-        try:
-            page.goto(GROK_HOME_URL, wait_until="domcontentloaded", timeout=30000)
-        except Exception as exc:
-            log(f"grok.com: {exc}")
-        try:
-            page.goto(AUTH_ORIGIN + "/sign-out", wait_until="domcontentloaded", timeout=45000)
-        except Exception as exc:
-            log(f"sign-out: {exc}")
-        if "cookie-chain" not in str(getattr(page, "url", "") or ""):
-            try:
-                page.goto(AUTH_ORIGIN + "/cookie-chain", wait_until="domcontentloaded", timeout=45000)
-            except Exception as exc:
-                log(f"cookie-chain open: {exc}")
-        _wait_cookie_chain(page, log, timeout=40, grace=8)
-        log(f"after cookie-chain url={str(getattr(page, 'url', '') or '')[:180]}")
-        try:
-            page.goto(GROK_SIGNUP_URL, wait_until="commit", timeout=20000)
-        except Exception as exc:
-            log(f"grok.com/sign-up: {exc}")
-        # Prelude is only what the sign-up document itself requests.
-        preamble.clear()
-        current = str(getattr(page, "url", "") or "")
-        if "accounts.x.ai/sign-up" not in current or not set(HAR_SIGNUP_QUERY_KEYS).issubset(
-            set(_query_keys(current))
-        ):
-            _goto_accounts_signup(page, log)
+        _goto_accounts_signup(page, log)
         log(f"sign-up url={str(getattr(page, 'url', '') or '')[:180]}")
         _wait_send_preamble(page, preamble, log)
         if _chrome_error_navigation(getattr(page, "url", "")):
@@ -976,6 +1046,64 @@ def _note_auth_response(captured: dict, response) -> None:
         captured[data_key] = data
 
 
+def _clearance_display() -> str:
+    for candidate in (":121", ":99"):
+        if Path(f"/tmp/.X11-unix/X{candidate[1:]}").exists():
+            return candidate
+    return ""
+
+
+def _harvest_headed_clearance(playwright, proxy_cfg, chrome: str, emit: Callable[[str], None]) -> tuple[list, str]:
+    """Open the sign-up page headed and return its cookies and user agent."""
+    display = _clearance_display()
+    if playwright is None or not display:
+        emit("headed clearance skipped")
+        return [], ""
+    user_dir = tempfile.mkdtemp(prefix="patchright-clearance-")
+    launch_kw: dict[str, Any] = {
+        "headless": False,
+        "no_viewport": True,
+        "env": {**os.environ, "DISPLAY": display},
+    }
+    if proxy_cfg:
+        launch_kw["proxy"] = proxy_cfg
+    if chrome:
+        launch_kw["executable_path"] = chrome
+    context = None
+    try:
+        context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(
+            _accounts_signup_url(),
+            wait_until="domcontentloaded",
+            timeout=45000,
+            referer=GROK_HOME_URL,
+        )
+        page.wait_for_timeout(5000)
+        ua = str(page.evaluate("() => navigator.userAgent") or "")
+        cookies = list(context.cookies() or [])
+        names = sorted(
+            {
+                str(cookie.get("name") or "")
+                for cookie in cookies
+                if str(cookie.get("name") or "").startswith("__cf")
+                or str(cookie.get("name") or "") == "cf_clearance"
+            }
+        )
+        emit(f"headed clearance names={names} ua_len={len(ua)}")
+        return cookies, ua
+    except Exception as exc:
+        emit(f"headed clearance failed: {exc}")
+        return [], ""
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        shutil.rmtree(user_dir, ignore_errors=True)
+
+
 def signup_with_patchright(
     *,
     har: Any,
@@ -1010,7 +1138,15 @@ def signup_with_patchright(
     shared_profile = str(os.environ.get("PATCHRIGHT_USER_DATA") or "").strip()
     keep_profile = bool(shared_profile)
     user_dir = shared_profile or tempfile.mkdtemp(prefix="patchright-ctx-")
-    headed = bool(os.environ.get("DISPLAY") or os.environ.get("PATCHRIGHT_HEADED"))
+    force_headless = str(os.environ.get("PATCHRIGHT_HEADLESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    headed = False if force_headless else bool(
+        os.environ.get("DISPLAY") or os.environ.get("PATCHRIGHT_HEADED")
+    )
     chrome = _chrome_path()
     sso = ""
     with sync_playwright() as playwright:
@@ -1019,12 +1155,25 @@ def signup_with_patchright(
             "headless": not headed,
             "no_viewport": True,
         }
+        clearance_cookies: list = []
+        if not headed:
+            clearance_cookies, clearance_ua = _harvest_headed_clearance(
+                playwright, proxy_cfg, chrome, emit
+            )
+            if clearance_ua:
+                launch_kw["user_agent"] = clearance_ua
         if proxy_cfg:
             launch_kw["proxy"] = proxy_cfg
         if chrome:
             launch_kw["executable_path"] = chrome
         context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
+        if clearance_cookies:
+            try:
+                context.add_cookies(clearance_cookies)
+            except Exception as exc:
+                emit(f"headed clearance cookies rejected: {exc}")
         browser = context.browser
+        _keep_castle_worker(context, emit)
         net: dict[str, Any] = {"expect_email": email}
 
         def on_request(request):
@@ -1097,14 +1246,18 @@ def signup_with_patchright(
             if sent_via_page:
                 status = _await_send_status(captured) if not accepted else int(captured.get("send_status") or 0)
                 emit(f"send-code response status={status or 'unconfirmed'}")
-                if not accepted and not (200 <= status < 300):
+                if not send_code_already_accepted(status, _otp_visible(page)):
                     error_code = str(captured.get("send_error") or "")
                     if error_code and not _send_code_resend_allowed(error_code):
                         raise_send_code_rejection(status or "missing", error_code, email)
-                    emit(f"send-code not accepted status={status or 'missing'}; resend")
-                    status = _resend_verification_code(page, captured, emit, email)
-                    sent_at = time.time()
-                    accepted = 200 <= status < 300 or _otp_visible(page)
+                    if not error_code:
+                        emit("send-code status missing; wait before resend")
+                        status = _await_send_status(captured, timeout=15.0) or status
+                    if not send_code_already_accepted(status, _otp_visible(page)):
+                        emit(f"send-code not accepted status={status or 'missing'}; resend")
+                        status = _resend_verification_code(page, captured, emit, email)
+                        sent_at = time.time()
+                accepted = send_code_already_accepted(status, _otp_visible(page))
                 if not accepted:
                     error_code = str(captured.get("send_error") or "")
                     if error_code in _SWITCH_EXIT_MAILBOX_CODES:
