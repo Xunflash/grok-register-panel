@@ -23,7 +23,7 @@ from batch_traffic import read_metrics as read_batch_traffic
 from batch_traffic import read_summary as read_batch_traffic_summary
 from webui.status_snapshot import SnapshotWorker, cached
 from webui.api_projection import PageConflict, etag, paginate, summary
-from webui.log_index import LogIndex
+from webui.log_index import LogIndex, warning_event
 from webui.maintenance_gate import MaintenanceGate
 from webui.log_retention import RotatingPipe, prune_closed_logs
 from runtime_platform import (
@@ -195,14 +195,14 @@ START_LOCK = threading.Lock()
 MAX_REQUEST_BODY = 64 * 1024
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
-RE_FAIL = re.compile(r"\[-\] 失败")
+RE_FAIL = re.compile(r"\[-\] (?:注册)?失败")
 RE_DOMAIN = re.compile(r"\[-\] 域名拒绝")
 RE_SKIP = re.compile(r"\[-\] 卡住跳过")
 RE_BOT0 = re.compile(r"botFlagSource=0")
 RE_BOT1 = re.compile(r"botFlagSource=1")
 RE_BFS = re.compile(r"JWT bfs 标记|bfs=yes|kind=bfs_flagged|has_bfs")
 RE_EMAIL_OK = re.compile(r"\[\+\] 注册成功(?:（[^）]*）)?:\s*(\S+)")
-RE_FAIL_KIND = re.compile(r"\[-\] 失败 \[([^\]]+)\]:\s*(.*)")
+RE_FAIL_KIND = re.compile(r"\[-\] (?:注册)?失败 \[([^\]]+)\]:\s*(.*)")
 RE_WORKER = re.compile(r"\[W(\d+)\]")
 RE_BATCH = re.compile(r"\[batch\] count=(\d+) workers=(\d+)")
 RE_START = re.compile(r"终端模式启动，目标数量:\s*(\d+)\s*\|\s*并发:\s*(\d+)")
@@ -444,6 +444,7 @@ def parse_log_legacy(path, max_tail=400_000):
     ended = None
     recent_ok = []
     recent_fail = []
+    recent_warn = []
     fail_kinds = {}
     worker_ok = {}
     worker_fail = {}
@@ -480,6 +481,9 @@ def parse_log_legacy(path, max_tail=400_000):
             worker_fail[w] = worker_fail.get(w, 0) + 1
             ts = line[1:9] if line.startswith("[") else ""
             recent_fail.append({"t": ts, "w": w, "kind": kind, "msg": redact_log_line(msg[:160])})
+        warning = warning_event(line)
+        if warning is not None:
+            recent_warn.append(warning)
         if RE_DOMAIN.search(line):
             domain += 1
         if RE_SKIP.search(line):
@@ -501,7 +505,7 @@ def parse_log_legacy(path, max_tail=400_000):
                 return 0
 
         ok = gcount("注册成功")
-        fail = gcount(r"\[-\] 失败")
+        fail = gcount(r"\[-\] 失败") + gcount(r"\[-\] 注册失败")
         bot0 = gcount("botFlagSource=0")
         bot1 = gcount("botFlagSource=1")
         bfs_hits = gcount("JWT bfs 标记") + gcount("bfs_flagged")
@@ -527,6 +531,7 @@ def parse_log_legacy(path, max_tail=400_000):
         # 前端分页每页 10 条；后端多留一些供翻页
         "recent_ok": recent_ok[-80:][::-1],
         "recent_fail": recent_fail[-80:][::-1],
+        "recent_warn": recent_warn[-80:][::-1],
         "tail": [redact_log_line(line) for line in last_lines],
     }
 
@@ -2725,7 +2730,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="card"><h2>Worker 成功 / 失败</h2><div class="chips" id="workers-stats"></div></div>
     <div class="card"><h2>失败分类</h2><div class="chips" id="fails"></div></div>
   </div>
-  <div class="two panel-gap">
+  <div class="three panel-gap">
     <div class="card">
       <div class="section-head">
         <h2>最近成功</h2>
@@ -2754,6 +2759,20 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+    <div class="card">
+      <div class="section-head">
+        <h2>警告日志</h2>
+        <span class="section-meta" id="warn-page-meta"></span>
+      </div>
+      <div class="table-scroll"><table><thead><tr><th>时间</th><th>W</th><th>类型</th><th>摘要</th></tr></thead><tbody id="warn-body"></tbody></table></div>
+      <div class="list-pager" id="warn-pager">
+        <span class="pager-info" id="warn-pager-info"></span>
+        <div class="pager-btns">
+          <button type="button" id="warn-prev" aria-label="上一页">上一页</button>
+          <button type="button" id="warn-next" aria-label="下一页">下一页</button>
+        </div>
+      </div>
+    </div>
   </div>
   <section class="card panel">
     <div class="section-head"><h2>日志尾部</h2></div>
@@ -2774,8 +2793,10 @@ const HELP_TAB_KEY = "GROK_REGISTER_HELP_TAB";
 const LIST_PAGE_SIZE = 10;
 let okPage = 1;
 let failPage = 1;
+let warnPage = 1;
 let okRowsCache = [];
 let failRowsCache = [];
+let warnRowsCache = [];
 // 完整成功统计（jsonl / by_day）；2s 轮询只更新本批数字，不能冲掉
 let lastFullStats = null;
 let ssoSource = "paste";
@@ -4104,9 +4125,11 @@ function render(d) {
   ).join("") : '<span style="color:var(--muted)">暂无失败</span>';
   if (Array.isArray(d.recent_ok)) okRowsCache = d.recent_ok.slice();
   if (Array.isArray(d.recent_fail)) failRowsCache = d.recent_fail.slice();
+  if (Array.isArray(d.recent_warn)) warnRowsCache = d.recent_warn.slice();
   // 新数据到来时，若当前页越界则收回最后一页；用户正在翻页时尽量保留页码
   renderOkPage();
   renderFailPage();
+  renderWarnPage();
   document.getElementById("tail").textContent = (d.tail || []).join("\n");
   document.getElementById("footer").textContent =
     "服务 " + location.host + " / 日志 " + (d.log || "") + " / 2 秒轮询 / "
@@ -4169,6 +4192,28 @@ function renderFailPage() {
   document.getElementById("fail-next").disabled = failPage >= pages || !rows.length;
 }
 
+function renderWarnPage() {
+  const rows = warnRowsCache || [];
+  warnPage = clampPage(warnPage, rows.length);
+  const pages = listPageCount(rows.length);
+  const start = (warnPage - 1) * LIST_PAGE_SIZE;
+  const slice = rows.slice(start, start + LIST_PAGE_SIZE);
+  document.getElementById("warn-body").innerHTML = slice.length
+    ? slice.map(r =>
+      `<tr><td class="mono">${esc(r.t)}</td><td>${esc(r.w)}</td><td class="warn">${esc(r.kind)}</td><td class="mono">${esc(r.msg)}</td></tr>`
+    ).join("")
+    : '<tr><td colspan="4" style="color:var(--muted)">暂无记录</td></tr>';
+  const meta = rows.length
+    ? `共 ${rows.length} 条 · 第 ${warnPage}/${pages} 页`
+    : "共 0 条";
+  document.getElementById("warn-page-meta").textContent = meta;
+  document.getElementById("warn-pager-info").textContent = rows.length
+    ? `每页 ${LIST_PAGE_SIZE} 条`
+    : "";
+  document.getElementById("warn-prev").disabled = warnPage <= 1 || !rows.length;
+  document.getElementById("warn-next").disabled = warnPage >= pages || !rows.length;
+}
+
 document.getElementById("ok-prev").addEventListener("click", () => {
   if (statusV2Enabled) { logPages.ok = Math.max(1, logPages.ok - 1); refreshLogPages(); return; }
   okPage = Math.max(1, okPage - 1);
@@ -4189,16 +4234,27 @@ document.getElementById("fail-next").addEventListener("click", () => {
   failPage += 1;
   renderFailPage();
 });
+document.getElementById("warn-prev").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.warn = Math.max(1, logPages.warn - 1); refreshLogPages(); return; }
+  warnPage = Math.max(1, warnPage - 1);
+  renderWarnPage();
+});
+document.getElementById("warn-next").addEventListener("click", () => {
+  if (statusV2Enabled) { logPages.warn++; refreshLogPages(); return; }
+  warnPage += 1;
+  renderWarnPage();
+});
 
-const logPages = { ok: 1, fail: 1 };
+const logPages = { ok: 1, fail: 1, warn: 1 };
 let logPagesPending = false;
 async function refreshLogPages() {
   if (!statusV2Enabled || document.hidden || logPagesPending) return;
   logPagesPending = true;
   try {
-    for (const kind of ["ok", "fail"]) {
+    for (const kind of ["ok", "fail", "warn"]) {
       const data = await api(`/api/logs?kind=${kind}&page=${logPages[kind]}&page_size=10`, { authHelp: false });
       if (kind === "ok") { okRowsCache = data.items; okPage = 1; renderOkPage(); }
+      else if (kind === "warn") { warnRowsCache = data.items; warnPage = 1; renderWarnPage(); }
       else { failRowsCache = data.items; failPage = 1; renderFailPage(); }
       document.getElementById(kind + "-prev").disabled = logPages[kind] <= 1;
       document.getElementById(kind + "-next").disabled = logPages[kind] * 10 >= data.total;
@@ -4393,7 +4449,7 @@ class Handler(BaseHTTPRequestHandler):
                     page = query.get("page", ["1"])[0]
                     size = query.get("page_size", ["40"])[0]
                     kind = query.get("kind", ["all"])[0]
-                    rows = value.get("recent_" + kind, []) if kind in {"ok", "fail"} else value.get("recent_fail", []) + value.get("recent_ok", [])
+                    rows = value.get("recent_" + kind, []) if kind in {"ok", "fail", "warn"} else value.get("recent_fail", []) + value.get("recent_ok", [])
                     self._json(200, paginate({"items": rows}, page, size, query.get("generation", [None])[0]))
                 except PageConflict:
                     self._json(409, {"error": "snapshot changed; restart pagination"})

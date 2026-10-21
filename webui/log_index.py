@@ -7,6 +7,32 @@ import threading
 from webui.security_utils import mask_email, redact_log_line
 
 
+def warning_event(line: str) -> dict | None:
+    """A failed attempt that is not scored as an error."""
+    text = str(line or "")
+    if "[-] 注册失败" in text or "[-] 失败" in text:
+        return None
+    if "existingEmail=" in text:
+        kind = "已注册邮箱"
+    elif "不计失败" in text:
+        kind = "不计失败"
+    elif "资源可重用" in text:
+        kind = "可重用重试"
+    elif "协议收件前失败" in text:
+        kind = "收件前失败"
+    elif "换出口和邮箱重试" in text:
+        kind = "换出口重试"
+    else:
+        return None
+    worker = re.search(r"\[W(\d+)\]", text)
+    worker = "W" + worker.group(1) if worker else "?"
+    stamp = text[1:9] if text.startswith("[") and len(text) > 9 else ""
+    message = redact_log_line(text)
+    message = re.sub(r"^\[[0-9:]{8}\]\s*", "", message)
+    message = re.sub(r"^\[W\d+\]\s*", "", message)
+    return {"t": stamp, "w": worker, "kind": kind, "msg": message[:160]}
+
+
 class LogIndex:
     def __init__(self):
         self.lock = threading.Lock()
@@ -17,6 +43,7 @@ class LogIndex:
         self.tail = deque(maxlen=40)
         self.ok_rows = deque(maxlen=80)
         self.fail_rows = deque(maxlen=80)
+        self.warn_rows = deque(maxlen=80)
 
     def read(self, path):
         if path is None or not path.is_file():
@@ -32,6 +59,7 @@ class LogIndex:
                 self.tail.clear()
                 self.ok_rows.clear()
                 self.fail_rows.clear()
+                self.warn_rows.clear()
             source.seek(self.offset)
             remaining = 4 * 1024 * 1024
             while remaining > 0 and (chunk := source.read(min(65536, remaining))):
@@ -46,7 +74,8 @@ class LogIndex:
             result = deepcopy(self.value)
             result.update(log=path.name, log_name=path.name, log_size=stat.st_size, mtime=stat.st_mtime,
                           caught_up=self.offset >= stat.st_size,
-                          recent_ok=list(reversed(self.ok_rows)), recent_fail=list(reversed(self.fail_rows)), tail=list(self.tail))
+                          recent_ok=list(reversed(self.ok_rows)), recent_fail=list(reversed(self.fail_rows)),
+                          recent_warn=list(reversed(self.warn_rows)), tail=list(self.tail))
             return result
 
     def consume(self, line):
@@ -68,10 +97,13 @@ class LogIndex:
             self.value["worker_ok"][worker] = self.value["worker_ok"].get(worker, 0) + 1
             email = re.search(r"\[\+\] 注册成功(?:（[^）]*）)?:\s*(\S+)", line)
             self.ok_rows.append({"t": stamp, "w": worker, "email": mask_email(email.group(1) if email else "")})
-        if "[-] 失败" in line:
+        warning = warning_event(line)
+        if warning is not None:
+            self.warn_rows.append(warning)
+        if "[-] 注册失败" in line or "[-] 失败" in line:
             self.value["fail"] += 1
             self.value["worker_fail"][worker] = self.value["worker_fail"].get(worker, 0) + 1
-            match = re.search(r"\[-\] 失败 \[([^\]]+)\]:\s*(.*)", line)
+            match = re.search(r"\[-\] (?:注册)?失败 \[([^\]]+)\]:\s*(.*)", line)
             kind, message = match.groups() if match else ("其它", line[-120:])
             if "inputs=none" in message:
                 kind = "空页UI"

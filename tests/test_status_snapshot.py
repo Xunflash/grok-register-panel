@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from webui.api_projection import etag, paginate, summary
-from webui.log_index import LogIndex
+from webui.log_index import LogIndex, warning_event
 from webui.status_snapshot import SnapshotWorker
 
 
@@ -30,6 +30,43 @@ class SnapshotTests(unittest.TestCase):
         for page in (0, -1, "invalid"):
             with self.assertRaises(ValueError):
                 paginate({"items": []}, page)
+
+    def test_unscored_failures_are_warnings_and_scored_failures_stay_errors(self):
+        scored = "[-] 注册失败 [其它]: castle SDK empty"
+        self.assertIsNone(warning_event(scored))
+        warning = warning_event("[!] existingEmail=person@example.test, retry another mailbox")
+        self.assertEqual(warning["kind"], "已注册邮箱")
+        self.assertNotIn("person@example.test", warning["msg"])
+        self.assertEqual(warning_event("[!] 协议收件前仍失败（未用邮箱/打码，不计失败）: tunnel")["kind"], "不计失败")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.log"
+            path.write_text(
+                "[batch] count=1 workers=1\n"
+                "[-] 注册失败 [其它]: castle SDK empty\n"
+                "[!] existingEmail=person@example.test, retry another mailbox\n"
+                "[!] 资源可重用，同槽位重试 1/1: send-code unavailable\n"
+            )
+            parsed = LogIndex().read(path)
+            self.assertEqual(parsed["fail"], 1)
+            self.assertEqual(parsed["recent_fail"][0]["kind"], "其它")
+            self.assertEqual([row["kind"] for row in parsed["recent_warn"]], ["可重用重试", "已注册邮箱"])
+
+    def test_traffic_summary_keeps_totals_for_the_homepage_card(self):
+        result = summary({
+            "traffic": {"batch_id": "batch-1", "bytes_up": 10, "bytes_down": 20, "bytes_total": 30, "running": False},
+            "traffic_summary": {
+                "batch_count": 2,
+                "total_bytes": 90,
+                "includes_current": True,
+                "bytes_per_batch": 45,
+                "bytes_per_success": 30,
+                "successful_accounts": 3,
+            },
+        })
+        self.assertTrue(result["traffic"]["batch_id"])
+        self.assertEqual(result["traffic_summary"]["total_bytes"], 90)
+        self.assertTrue(result["traffic_summary"]["includes_current"])
+        self.assertEqual(result["traffic_summary"]["bytes_per_batch"], 45)
 
     def test_incremental_append_partial_line_and_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
