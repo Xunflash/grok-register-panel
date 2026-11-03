@@ -162,6 +162,7 @@ def test_page_engine_is_patchright_not_playwright_or_camoufox():
     from webui.api_projection import CONTROL_ENUMS
 
     assert "protocol_patchright" in CONTROL_ENUMS["registration_scheme"]
+    assert "curl_cffi" in CONTROL_ENUMS["registration_scheme"]
     from nobrowser_protocol.cffi_engine import camoufox_imports
     from nobrowser_protocol.patchright_engine import (
         _castle_from_capture_or_mint,
@@ -696,9 +697,14 @@ def test_send_code_rejection_switches_exit_and_mailbox():
     assert out["email"] == "box3@outlook.com"
     assert calls["rotated"] == 2
     assert calls["marked"] == [
-        ("box1@outlook.com", "send_code_switch"),
         ("box2@outlook.com", "send_code_switch"),
     ]
+    rejected = SendCodeSwitchError("account:email-signup-unavailable", "a@outlook.com", status=400)
+    from nobrowser_protocol.patchright_engine import send_code_switch_marks_used
+
+    assert send_code_switch_marks_used(rejected) is False
+    limited = SendCodeSwitchError("email:send-validation-code-rate-limited", "a@outlook.com", status=429)
+    assert send_code_switch_marks_used(limited) is True
 
 
 def test_outlook_code_miss_switches_mailbox_and_does_not_count():
@@ -867,6 +873,84 @@ def test_panel_worker_loads_patchright_otp_without_outlook_min():
         sys.path[:] = old_path
 
 
+def test_patchright_enables_swiftshader_and_covers_the_renderer():
+    from nobrowser_protocol.patchright_engine import PATCHRIGHT_WEBGL_ARGS, _webgl_init_script
+
+    assert "--enable-unsafe-swiftshader" in PATCHRIGHT_WEBGL_ARGS
+    assert "--use-angle=swiftshader" in PATCHRIGHT_WEBGL_ARGS
+    script = _webgl_init_script("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, GeForce)")
+    assert "37446" in script
+    assert "swiftshader" in script
+
+
+def test_castle_ready_ignores_a_script_without_the_worker_timeout():
+    from nobrowser_protocol.patchright_engine import (
+        _CASTLE_PLATFORM_WORKER_TIMEOUT,
+        _CASTLE_STYLE_LOOP,
+        castle_worker_script_ready,
+        extend_castle_worker_timeout,
+    )
+
+    assert castle_worker_script_ready("var x=1;" + _CASTLE_PLATFORM_WORKER_TIMEOUT) is True
+    assert castle_worker_script_ready("var x=1;") is False
+    patched = extend_castle_worker_timeout("mJ=1500,mN=3e3," + _CASTLE_STYLE_LOOP)
+    assert "mJ=20000" in patched
+    assert "mN=20000" in patched
+    assert "document.documentElement" in patched
+
+
+def test_submit_waits_for_the_castle_script():
+    from nobrowser_protocol.patchright_engine import _wait_castle_sdk
+
+    ready = {"seen": False}
+
+    class _Page:
+        def __init__(self):
+            self.waits = 0
+
+        def wait_for_timeout(self, _ms):
+            self.waits += 1
+            if self.waits >= 2:
+                ready["seen"] = True
+
+    page = _Page()
+    logs = []
+    assert _wait_castle_sdk(page, ready, logs.append, timeout=2) is True
+    assert page.waits == 3
+    assert any("castle sdk seen" in line for line in logs)
+
+
+def test_create_reuses_send_code_token_without_the_30s_wait():
+    engine = (ROOT / "nobrowser_protocol" / "patchright_engine.py").read_text(encoding="utf-8")
+    from nobrowser_protocol.patchright_engine import CREATE_PAGE_WAIT_S, _PREAMBLE_SETTLE_MS
+
+    assert CREATE_PAGE_WAIT_S <= 1
+    assert _PREAMBLE_SETTLE_MS <= 1000
+    assert 'create_status", timeout=30' not in engine
+    assert "page.wait_for_timeout(8000)" not in engine
+    create = engine.split("page create status", 1)[1]
+    assert create.find("if not fresh:") < create.find("_mint_castle(")
+
+
+def test_cookie_chain_returns_when_sso_cookie_is_set():
+    from nobrowser_protocol.patchright_engine import _wait_cookie_chain
+
+    class _Page:
+        url = "https://accounts.x.ai/set-cookie?step=1"
+
+        def wait_for_timeout(self, _ms):
+            raise AssertionError("cookie-chain waited after sso was ready")
+
+    class _Context:
+        def cookies(self):
+            return [{"name": "sso", "value": "sso-value-long-enough"}]
+
+    logs = []
+    url = _wait_cookie_chain(_Page(), logs.append, timeout=5, grace=2, context=_Context())
+    assert url.startswith("https://accounts.x.ai/set-cookie")
+    assert any("sso ready" in line for line in logs)
+
+
 if __name__ == "__main__":
     test_shipped_builders_match_har_auth_name_contract()
     test_page_engine_is_patchright_not_playwright_or_camoufox()
@@ -876,4 +960,9 @@ if __name__ == "__main__":
     test_patchright_panel_retries_existing_email_and_marks_used()
     test_patchright_pre_inbox_retries_unspent_then_counts_spent()
     test_panel_worker_loads_patchright_otp_without_outlook_min()
+    test_patchright_enables_swiftshader_and_covers_the_renderer()
+    test_castle_ready_ignores_a_script_without_the_worker_timeout()
+    test_submit_waits_for_the_castle_script()
+    test_create_reuses_send_code_token_without_the_30s_wait()
+    test_cookie_chain_returns_when_sso_cookie_is_set()
     print("OK nobrowser protocol")

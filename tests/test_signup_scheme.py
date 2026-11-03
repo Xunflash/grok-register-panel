@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from signup_scheme import (  # noqa: E402
     ENV_NAME,
     SCHEME_BROWSER,
+    SCHEME_CURL_CFFI,
     SCHEME_PROTOCOL,
     SCHEME_PROTOCOL_PATCHRIGHT,
     load_registration_scheme,
@@ -32,6 +33,8 @@ def test_resolve_registration_scheme_aliases():
     assert resolve_registration_scheme("patchright") == SCHEME_PROTOCOL_PATCHRIGHT
     assert resolve_registration_scheme("patchwright") == SCHEME_PROTOCOL_PATCHRIGHT
     assert resolve_registration_scheme("协议注册（patchright）") == SCHEME_PROTOCOL_PATCHRIGHT
+    assert resolve_registration_scheme("curl_cffi") == SCHEME_CURL_CFFI
+    assert resolve_registration_scheme("协议注册（curl_cffi）") == SCHEME_CURL_CFFI
     assert resolve_registration_scheme("协议注册") == SCHEME_PROTOCOL
     assert resolve_registration_scheme("") == SCHEME_BROWSER
     assert resolve_registration_scheme("nope") == SCHEME_BROWSER
@@ -165,6 +168,8 @@ def test_loader_source_imports_shipped_protocol_entry():
     text = (ROOT / "signup_scheme.py").read_text(encoding="utf-8")
     assert "from protocol_register_once import run_protocol_signup" in text
     assert "signup_with_patchright" in text
+    assert "signup_with_curl_cffi" in text
+    assert "SCHEME_CURL_CFFI" in text
     assert "meter_proxy_url" in text
     assert "SCHEME_PROTOCOL_PATCHRIGHT" in text
     proto = (ROOT / "protocol_register_once.py").read_text(encoding="utf-8")

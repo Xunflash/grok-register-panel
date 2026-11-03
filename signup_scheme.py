@@ -10,8 +10,9 @@ from typing import Any, Callable, Optional
 SCHEME_BROWSER = "browser"
 SCHEME_PROTOCOL = "protocol"
 SCHEME_PROTOCOL_PATCHRIGHT = "protocol_patchright"
+SCHEME_CURL_CFFI = "curl_cffi"
 ENV_NAME = "GROK_REGISTRATION_SCHEME"
-VALID_SCHEMES = (SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT)
+VALID_SCHEMES = (SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT, SCHEME_CURL_CFFI)
 
 SCHEME_ALIASES = {
     "browser": SCHEME_BROWSER,
@@ -36,12 +37,18 @@ SCHEME_ALIASES = {
     "patchwright": SCHEME_PROTOCOL_PATCHRIGHT,
     "协议注册（patchright）": SCHEME_PROTOCOL_PATCHRIGHT,
     "协议注册(patchright)": SCHEME_PROTOCOL_PATCHRIGHT,
+    "curl_cffi": SCHEME_CURL_CFFI,
+    "curl-cffi": SCHEME_CURL_CFFI,
+    "cffi": SCHEME_CURL_CFFI,
+    "协议注册（curl_cffi）": SCHEME_CURL_CFFI,
+    "协议注册(curl_cffi)": SCHEME_CURL_CFFI,
 }
 
 SCHEME_LABELS = {
     SCHEME_BROWSER: "浏览器注册",
     SCHEME_PROTOCOL: "协议注册",
     SCHEME_PROTOCOL_PATCHRIGHT: "协议注册（patchright）",
+    SCHEME_CURL_CFFI: "协议注册（curl_cffi）",
 }
 
 
@@ -147,8 +154,13 @@ def retry_patchright_mailboxes(
             switched_send = True
             last_code = str(exc.code or "")
             last_existing = str(exc.email or email)
-            _mark_mailbox(mark_used, last_existing, "send_code_switch")
-            log(f"[!] send-code {last_code}，换出口和邮箱重试")
+            from nobrowser_protocol.patchright_engine import send_code_switch_marks_used
+
+            if send_code_switch_marks_used(exc):
+                _mark_mailbox(mark_used, last_existing, "send_code_switch")
+                log(f"[!] send-code {last_code}，换出口和邮箱重试")
+            else:
+                log(f"[!] send-code {last_code}，邮箱不记 used，换出口和邮箱重试")
             if mail_try < tries and callable(rotate_exit):
                 rotate_exit()
             continue
@@ -288,7 +300,16 @@ def _run_patchright_signup(
                     log=emit,
                     usage=usage,
                 )
-            except SendCodeSwitchError:
+            except SendCodeSwitchError as exc:
+                from nobrowser_protocol.patchright_engine import send_code_switch_marks_used
+
+                if not send_code_switch_marks_used(exc):
+                    try:
+                        from email_providers.outlook_rt import release_for_reuse
+
+                        release_for_reuse(mail_token, email)
+                    except Exception:
+                        pass
                 raise
             except Exception:
                 if not getattr(usage, "email_used", False) and not getattr(
@@ -342,6 +363,155 @@ def _run_patchright_signup(
     }
 
 
+def _run_curl_cffi_signup(
+    log_callback: Optional[Callable[[str], Any]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """Panel worker entry: mailbox, metered proxy, Turnstile, curl_cffi signup."""
+    from browser_session import get_bound_proxy
+    from email_providers.outlook_rt import release_reservation
+    from grok_register_ttk import get_email_and_token, get_oai_code, mark_outlook_rt_used
+    from nobrowser_protocol.curl_cffi_signup import signup_with_curl_cffi
+    from nobrowser_protocol.patchright_engine import SendCodeSwitchError, send_code_switch_marks_used
+
+    emit = log_callback or (lambda _m: None)
+
+    def _cancel() -> None:
+        if callable(cancel_callback) and cancel_callback():
+            from grok_register_ttk import RegistrationCancelled
+
+            raise RegistrationCancelled("stopped")
+
+    _cancel()
+
+    def _once(usage) -> dict:
+        from grok_register_ttk import get_thread_proxy
+
+        def _proxy_now() -> str:
+            raw = str(get_thread_proxy() or get_bound_proxy() or "")
+            if not raw:
+                return ""
+            from batch_traffic import meter_proxy_url
+
+            return meter_proxy_url(raw)
+
+        proxy_box = {"url": _proxy_now()}
+
+        def signup(email: str, mail_token: str) -> dict:
+            def wait_otp(_after_ts: float, _email=email, _token=mail_token) -> str:
+                _cancel()
+                return get_oai_code(
+                    _token,
+                    _email,
+                    log_callback=emit,
+                    cancel_callback=cancel_callback,
+                )
+
+            def solve_ts(sitekey: str) -> str:
+                _cancel()
+                key = sitekey or "0x4AAAAAAAhr9JGVDZbrZOo0"
+                origin = "https://accounts.x.ai/sign-up?redirect=grok-com"
+                from nobrowser_protocol.turnstile_patchright import (
+                    pool_enabled,
+                    pool_fallback_enabled,
+                    try_dequeue_token,
+                )
+
+                if pool_enabled():
+                    try:
+                        solved = try_dequeue_token(
+                            sitekey=key,
+                            origin=origin,
+                            proxy=proxy_box["url"],
+                            log=emit,
+                        )
+                        if solved is not None and solved.token:
+                            emit(f"[*] curl_cffi turnstile from pool len={len(solved.token)}")
+                            return solved.token
+                    except Exception as exc:
+                        emit(f"[!] turnstile pool dequeue: {exc}")
+                if not pool_fallback_enabled():
+                    raise RuntimeError("turnstile pool empty and capsolver fallback is off")
+                from turnstile_solver import solve_turnstile as panel_solve_turnstile
+
+                emit("[*] curl_cffi turnstile fallback cloud solver")
+                return panel_solve_turnstile(
+                    origin,
+                    key,
+                    log=emit,
+                    cancel=_cancel,
+                )
+
+            try:
+                return signup_with_curl_cffi(
+                    proxy=proxy_box["url"],
+                    email=email,
+                    wait_otp=wait_otp,
+                    solve_ts=solve_ts,
+                    log=emit,
+                    usage=usage,
+                )
+            except SendCodeSwitchError as exc:
+                if not send_code_switch_marks_used(exc):
+                    try:
+                        from email_providers.outlook_rt import release_for_reuse
+
+                        release_for_reuse(mail_token, email)
+                    except Exception:
+                        pass
+                raise
+            except Exception:
+                if not getattr(usage, "email_used", False) and not getattr(
+                    usage, "remote_captcha_used", False
+                ):
+                    try:
+                        release_reservation(mail_token, email)
+                    except Exception:
+                        pass
+                raise
+
+        def mark_used(email: str, reason: str = "existing_email") -> None:
+            if usage is not None:
+                usage.email_used = True
+            mark_outlook_rt_used(email, reason=reason, log_callback=emit)
+
+        def rotate_exit() -> None:
+            from browser_session import set_exit_context
+
+            recycle_patchright_exit(emit)
+            nxt = _proxy_now()
+            if nxt:
+                set_exit_context(proxy=nxt, exit_ip="")
+            proxy_box["url"] = nxt
+
+        return retry_patchright_mailboxes(
+            take_mailbox=get_email_and_token,
+            signup=signup,
+            mark_used=mark_used,
+            log=emit,
+            cancel=_cancel,
+            max_tries=3,
+            rotate_exit=rotate_exit,
+        )
+
+    outcome = run_patchright_pre_inbox(
+        _once,
+        recycle=lambda: recycle_patchright_exit(emit),
+        log_fn=emit,
+        cancel=_cancel,
+    )
+    return {
+        "email": outcome["email"],
+        "profile": {
+            "password": outcome["password"],
+            "given_name": outcome["given_name"],
+            "family_name": outcome["family_name"],
+        },
+        "sso": outcome["sso"],
+        "scheme": SCHEME_CURL_CFFI,
+    }
+
+
 def _prepare_protocol_browser(log_fn: Callable[[str], Any]) -> None:
     from browser_session import active_browser, restart_browser, start_browser
 
@@ -370,6 +540,16 @@ def maybe_run_protocol_signup(
     """
     log_fn = log_callback or (lambda _m: None)
     scheme = load_registration_scheme()
+    if scheme == SCHEME_CURL_CFFI:
+        log_fn(
+            f"[*] 注册方案: {SCHEME_LABELS[SCHEME_CURL_CFFI]}"
+            "（curl_cffi 发码/建号，Castle 由 Node 按本轮样式名和账号指纹生成，Turnstile 走云打码，不启动 Camoufox）"
+        )
+        result = _run_curl_cffi_signup(log_callback=log_fn, cancel_callback=cancel_callback)
+        if not isinstance(result, dict) or not result.get("sso"):
+            raise RuntimeError("curl_cffi signup returned no sso")
+        result.setdefault("scheme", SCHEME_CURL_CFFI)
+        return result
     if scheme == SCHEME_PROTOCOL_PATCHRIGHT:
         log_fn(
             f"[*] 注册方案: {SCHEME_LABELS[SCHEME_PROTOCOL_PATCHRIGHT]}"

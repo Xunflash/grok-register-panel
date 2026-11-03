@@ -153,6 +153,111 @@ def _rand_password() -> str:
     return "Aa1!" + "".join(random.choice(chars) for _ in range(10))
 
 
+# Chromium 145 no longer creates a WebGL context on this Xvfb unless SwiftShader
+# is opted in. Fingerprint browsers then replace the software renderer string.
+PATCHRIGHT_WEBGL_ARGS = (
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+)
+
+
+def _webgl_init_script(vendor: str, renderer: str) -> str:
+    payload = json.dumps({"vendor": vendor, "renderer": renderer})
+    return f"""
+(() => {{
+  const cfg = {payload};
+  const patch = (proto) => {{
+    if (!proto || proto.__grokWebgl) return;
+    const origGet = proto.getParameter;
+    proto.getParameter = function(name) {{
+      if (name === 37445) return cfg.vendor;
+      if (name === 37446) return cfg.renderer;
+      const value = origGet.apply(this, arguments);
+      if (typeof value === "string" && /swiftshader|llvmpipe|swrast/i.test(value)) {{
+        return name === 7937 ? cfg.renderer : cfg.vendor;
+      }}
+      return value;
+    }};
+    const origExt = proto.getExtension;
+    proto.getExtension = function(name) {{
+      const ext = origExt.apply(this, arguments);
+      if (name === "WEBGL_debug_renderer_info") {{
+        return ext || {{ UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 }};
+      }}
+      return ext;
+    }};
+    proto.__grokWebgl = true;
+  }};
+  patch(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
+  patch(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
+}})();
+"""
+
+
+def _apply_patchright_fingerprint(context, page, fp: dict, emit: Callable[[str], None]) -> None:
+    """Apply the Camoufox-style region fingerprint on Chromium."""
+    vendor = str(fp.get("webgl_vendor") or "")
+    renderer = str(fp.get("webgl_renderer") or "")
+    if vendor and renderer:
+        try:
+            context.add_init_script(_webgl_init_script(vendor, renderer))
+        except Exception as exc:
+            emit(f"fp webgl: {exc}")
+    webgl_source = _webgl_init_script(vendor, renderer) if vendor and renderer else ""
+    version = str(fp.get("user_agent") or "")
+    hints = dict(fp.get("ua_metadata") or {})
+    try:
+        session = context.new_cdp_session(page)
+        if webgl_source:
+            session.send("Page.addScriptToEvaluateOnNewDocument", {"source": webgl_source})
+        session.send(
+            "Emulation.setUserAgentOverride",
+            {
+                "userAgent": version,
+                "platform": str(fp.get("platform") or "Win32"),
+                "userAgentMetadata": {
+                    "brands": hints.get("brands") or [],
+                    "fullVersionList": hints.get("fullVersionList") or [],
+                    "fullVersion": str(hints.get("fullVersion") or ""),
+                    "platform": str(hints.get("platform") or "Windows"),
+                    "platformVersion": str(hints.get("platformVersion") or "15.0.0"),
+                    "architecture": str(hints.get("architecture") or "x86"),
+                    "model": str(hints.get("model") or ""),
+                    "mobile": bool(hints.get("mobile")),
+                    "bitness": str(hints.get("bitness") or "64"),
+                    "wow64": bool(hints.get("wow64")),
+                },
+            },
+        )
+    except Exception as exc:
+        emit(f"fp ua: {exc}")
+    screen = fp.get("screen") or (0, 0)
+    try:
+        width, height = int(screen[0]), int(screen[1])
+        if width and height:
+            session.send(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                    "screenWidth": width,
+                    "screenHeight": height,
+                },
+            )
+    except Exception as exc:
+        emit(f"fp screen: {exc}")
+    emit(
+        "fp "
+        f"tz={fp.get('timezone_id') or 'server'} "
+        f"screen={screen[0]}x{screen[1]} "
+        f"webgl={renderer[:72]}"
+    )
+
+
 def _proxy_for_patchright(proxy_url: str) -> dict | None:
     raw = str(proxy_url or "").strip()
     if not raw:
@@ -246,8 +351,18 @@ def _dump_page(page, log: Callable[[str], None], prefix: str) -> None:
     log(f"{prefix} {json.dumps(dump, ensure_ascii=False)[:700]}")
 
 
+def _email_field_visible(page) -> bool:
+    try:
+        return bool(page.locator(EMAIL_INPUT_SELECTOR).first.is_visible(timeout=200))
+    except Exception:
+        return False
+
+
 def _open_email_form(page, log: Callable[[str], None]) -> None:
-    cookie = _click_first(page, COOKIE_NEEDLES, timeout=2500)
+    if _email_field_visible(page):
+        log("email field already visible")
+        return
+    cookie = _click_first(page, COOKIE_NEEDLES, timeout=600)
     if cookie:
         log(f"cookie banner click={cookie!r}")
         page.wait_for_timeout(500)
@@ -413,25 +528,73 @@ EMAIL_INPUT_SELECTOR = (
     'input[autocomplete="email"]:not([readonly]):visible'
 )
 
+# Signals are already true before this pause. The old 8s sleep did not change the token.
+_PREAMBLE_SETTLE_MS = 1000
+# The page button does not emit create-account. Waiting 30s only delayed the fetch that returns 200.
+CREATE_PAGE_WAIT_S = 0.5
+
 
 _CASTLE_WORKER_TIMEOUT = "r[9]=r[8]?mN:mJ"
 _CASTLE_WORKER_TIMEOUT_MS = "r[9]=20000"
-
+_CASTLE_FAST_TIMEOUT = "mJ=1500"
+_CASTLE_FAST_TIMEOUT_MS = "mJ=20000"
+_CASTLE_SLOW_TIMEOUT = "mN=3e3"
+_CASTLE_SLOW_TIMEOUT_MS = "mN=20000"
 
 _CASTLE_PLATFORM_WORKER_TIMEOUT = "f[20]=setTimeout(function(){f[10]=!0,f[15]()},f[21])"
-_CASTLE_PLATFORM_WORKER_TIMEOUT_MS = "f[20]=setTimeout(function(){f[10]=!0,f[15]()},20000)"
+_CASTLE_PLATFORM_WORKER_TIMEOUT_MS = (
+    'f[20]=setTimeout(function(){f[10]=!0,'
+    'document.documentElement.setAttribute("data-castle-pw","timeout"),f[15]()},20000)'
+)
+_CASTLE_SHARED_OK = "r[3](n[m4])"
+_CASTLE_SHARED_OK_MARK = (
+    'r[3]((document.documentElement.setAttribute("data-castle-sw","ok"),n[m4]))'
+)
+_CASTLE_PLATFORM_OK = "f[13]=n[m4][ntB]"
+_CASTLE_PLATFORM_OK_MARK = (
+    'f[13]=(document.documentElement.setAttribute("data-castle-pw","ok"),n[m4][ntB])'
+)
+_CASTLE_SHARED_TIMEOUT = "W(vr,r[3],mW,bC,pl,yA)"
+_CASTLE_SHARED_TIMEOUT_MARK = (
+    'W(vr,(document.documentElement.setAttribute("data-castle-sw","timeout"),r[3]),mW,bC,pl,yA)'
+)
+# body can be shorter than documentElement while the signup CSS is still applying
+_CASTLE_STYLE_LOOP = (
+    "for(var n=getComputedStyle(document[C7]),r=[],t=vs[CQ](n[yC],nuj),u=ys;t>u;u++)"
+    "r[bS](n[u]);return W(a2,r[yq](hW))"
+)
+_CASTLE_STYLE_LOOP_FILLED = (
+    "for(var n=function(){var els=[document[C7],document.documentElement],best=null,bestLen=-1,k=0;"
+    "for(;k<els.length;k++){if(!els[k])continue;var cs=getComputedStyle(els[k]);"
+    "if(cs&&cs[yC]>bestLen){best=cs;bestLen=cs[yC];}}return best;}(),"
+    "r=[],t=n?vs[CQ](n[yC],nuj):ys,u=ys;t>u;u++)r[bS](n[u]);return W(a2,r[yq](hW))"
+)
 
 
 def extend_castle_worker_timeout(source: str) -> str:
-    """Let Castle's workers finish. Both otherwise give up after 1.5s."""
-    if _CASTLE_WORKER_TIMEOUT in source:
-        source = source.replace(_CASTLE_WORKER_TIMEOUT, _CASTLE_WORKER_TIMEOUT_MS, 1)
-    if _CASTLE_PLATFORM_WORKER_TIMEOUT in source:
-        source = source.replace(_CASTLE_PLATFORM_WORKER_TIMEOUT, _CASTLE_PLATFORM_WORKER_TIMEOUT_MS, 1)
+    """Keep worker fingerprints and the longer computed-style list."""
+    replacements = (
+        (_CASTLE_FAST_TIMEOUT, _CASTLE_FAST_TIMEOUT_MS),
+        (_CASTLE_SLOW_TIMEOUT, _CASTLE_SLOW_TIMEOUT_MS),
+        (_CASTLE_WORKER_TIMEOUT, _CASTLE_WORKER_TIMEOUT_MS),
+        (_CASTLE_PLATFORM_WORKER_TIMEOUT, _CASTLE_PLATFORM_WORKER_TIMEOUT_MS),
+        (_CASTLE_SHARED_OK, _CASTLE_SHARED_OK_MARK),
+        (_CASTLE_PLATFORM_OK, _CASTLE_PLATFORM_OK_MARK),
+        (_CASTLE_SHARED_TIMEOUT, _CASTLE_SHARED_TIMEOUT_MARK),
+        (_CASTLE_STYLE_LOOP, _CASTLE_STYLE_LOOP_FILLED),
+    )
+    for old, new in replacements:
+        if old in source:
+            source = source.replace(old, new, 1)
     return source
 
 
-def _keep_castle_worker(context, log: Callable[[str], None]) -> None:
+def castle_worker_script_ready(body: str) -> bool:
+    """True only for the SDK build that still contains the 1500ms worker timeout."""
+    return extend_castle_worker_timeout(body) != body
+
+
+def _keep_castle_worker(context, log: Callable[[str], None], ready: dict | None = None) -> None:
     def handle(route):
         try:
             response = route.fetch()
@@ -446,11 +609,77 @@ def _keep_castle_worker(context, log: Callable[[str], None]) -> None:
             if key.lower() not in {"content-length", "content-encoding"}
         }
         patched = extend_castle_worker_timeout(body)
-        if patched != body:
+        if castle_worker_script_ready(body):
             log("castle worker wait=20000")
+            if ready is not None:
+                ready["seen"] = True
         route.fulfill(status=response.status, headers=headers, body=patched)
 
     context.route("**/*02bh2mv7efkj1.js*", handle)
+
+
+def _castle_sample(page) -> dict:
+    if not hasattr(page, "evaluate"):
+        return {}
+    try:
+        state = page.evaluate(
+            """() => {
+                const body = document.body ? getComputedStyle(document.body).length : 0;
+                const root = document.documentElement ? getComputedStyle(document.documentElement).length : 0;
+                return {
+                    sw: document.documentElement.getAttribute('data-castle-sw'),
+                    pw: document.documentElement.getAttribute('data-castle-pw'),
+                    props: Math.max(body, root)
+                };
+            }"""
+        )
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _wait_castle_samples(page, log: Callable[[str], None], timeout: float = 20.0) -> None:
+    """Mint only after both workers have posted real values and the style list has settled."""
+    if not hasattr(page, "evaluate"):
+        return
+    deadline = time.time() + timeout
+    last_props = None
+    stable = 0
+    state: dict = {}
+    while time.time() < deadline:
+        state = _castle_sample(page)
+        props = int(state.get("props") or 0)
+        workers_ok = state.get("sw") == "ok" and state.get("pw") == "ok"
+        if workers_ok and props and props == last_props:
+            stable += 1
+            if stable >= 2:
+                log(f"castle samples sw=ok pw=ok style_props={props}")
+                return
+        else:
+            stable = 0
+        last_props = props
+        page.wait_for_timeout(200)
+    log(
+        "castle samples incomplete "
+        f"sw={state.get('sw') or 'missing'} "
+        f"pw={state.get('pw') or 'missing'} "
+        f"style_props={last_props or 0}"
+    )
+
+
+def _wait_castle_sdk(page, ready: dict, log: Callable[[str], None], timeout: float = 30.0) -> bool:
+    """Click only after the patched Castle script has been delivered."""
+    started = time.time()
+    deadline = started + timeout
+    while time.time() < deadline:
+        if ready.get("seen"):
+            page.wait_for_timeout(800)
+            _wait_castle_samples(page, log)
+            log(f"castle sdk seen wait_ms={int((time.time() - started) * 1000)}")
+            return True
+        page.wait_for_timeout(200)
+    log("castle sdk script not seen")
+    return False
 
 
 def _play_signup_events(page, log: Callable[[str], None], rounds: int = 1) -> None:
@@ -488,6 +717,8 @@ def _fill_signup_email(page, email: str, log: Callable[[str], None]) -> dict:
         loc.wait_for(state="visible", timeout=20000)
         loc.click(timeout=3000)
         loc.fill("", timeout=3000)
+        # A gap over 1s between the field click and the first key is its own event-log record.
+        page.wait_for_timeout(1200)
         split = max(1, len(email) // 2)
         loc.press_sequentially(email[:split], delay=90)
         page.wait_for_timeout(1200)
@@ -514,6 +745,7 @@ def _capture_send_code(
     log: Callable[[str], None],
     timeout: float = 45.0,
     captured: dict[str, Any] | None = None,
+    sdk_ready: dict | None = None,
 ) -> dict:
     """Let the live page SDK fire send-code; capture castleRequestToken from that XHR."""
     captured = captured if captured is not None else {}
@@ -555,6 +787,8 @@ def _capture_send_code(
     page.on("request", on_request)
     page.on("response", on_response)
     try:
+        if sdk_ready is not None:
+            _wait_castle_sdk(page, sdk_ready, log)
         _open_email_form(page, log)
         _play_signup_events(page, log)
         filled = _fill_signup_email(page, email, log)
@@ -636,16 +870,27 @@ _SWITCH_EXIT_MAILBOX_CODES = frozenset(
 class SendCodeSwitchError(Exception):
     """x.ai rejected send-code. Caller switches exit and mailbox."""
 
-    def __init__(self, code: str, email: str = "") -> None:
+    def __init__(self, code: str, email: str = "", status: object = None) -> None:
         self.code = str(code or "").strip()
         self.email = str(email or "").strip()
+        try:
+            self.status = int(status or 0)
+        except (TypeError, ValueError):
+            self.status = 0
         super().__init__(f"send-code {self.code}")
+
+
+def send_code_switch_marks_used(exc: SendCodeSwitchError) -> bool:
+    """A send-code HTTP 400 leaves the mailbox in the unused pool."""
+    if int(getattr(exc, "status", 0) or 0) == 400:
+        return False
+    return str(getattr(exc, "code", "") or "") != "account:email-signup-unavailable"
 
 
 def raise_send_code_rejection(status: object, error_code: str, email: str = "") -> None:
     code = str(error_code or "").strip()
     if code in _SWITCH_EXIT_MAILBOX_CODES:
-        raise SendCodeSwitchError(code, email)
+        raise SendCodeSwitchError(code, email, status=status)
     detail = f" code={code}" if code else ""
     raise RuntimeError(f"send-code not accepted status={status}{detail}")
 
@@ -813,11 +1058,21 @@ def _cookie_chain_url(url: str) -> bool:
     return any(part in text for part in ("cookie-chain", "delete-cookie", "set-cookie"))
 
 
-def _wait_cookie_chain(page, log: Callable[[str], None], timeout: float = 40.0, grace: float = 3.0) -> str:
-    """Let the page finish the cookie-chain hops the manual signup walks."""
+def _wait_cookie_chain(
+    page,
+    log: Callable[[str], None],
+    timeout: float = 40.0,
+    grace: float = 3.0,
+    context=None,
+) -> str:
+    """Stop once the SSO cookie is set, otherwise follow the cookie-chain hops."""
     started = time.time()
     saw = False
     while time.time() - started < timeout:
+        if context is not None and _sso_from_context(context):
+            url = str(getattr(page, "url", "") or "")
+            log(f"cookie-chain sso ready url={url[:140]}")
+            return url
         url = str(getattr(page, "url", "") or "")
         if _cookie_chain_url(url):
             saw = True
@@ -907,8 +1162,8 @@ def _wait_send_preamble(page, flags: dict, log: Callable[[str], None], timeout: 
             break
         page.wait_for_timeout(250)
     if preamble_ready(flags):
-        # HAR waited through monitoring/RUM after /sign-in before the POST.
-        page.wait_for_timeout(8000)
+        # Turnstile, set-cookie, and /sign-in have already been requested.
+        page.wait_for_timeout(_PREAMBLE_SETTLE_MS)
     log(
         "send preamble "
         f"turnstile={bool(flags.get('turnstile'))} "
@@ -1104,6 +1359,20 @@ def _harvest_headed_clearance(playwright, proxy_cfg, chrome: str, emit: Callable
         shutil.rmtree(user_dir, ignore_errors=True)
 
 
+def _live_har_path() -> str:
+    """Per-attempt HAR path. Empty unless this run asked to record."""
+    directory = str(os.environ.get("GROK_RECORD_HAR_DIR") or "").strip()
+    explicit = str(os.environ.get("GROK_RECORD_HAR") or "").strip()
+    if not directory and not explicit:
+        return ""
+    dest = Path(directory) if directory else Path(explicit)
+    if dest.suffix.lower() == ".har":
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return str(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    return str(dest / f"{os.getpid()}-{uuid.uuid4().hex[:8]}.har")
+
+
 def signup_with_patchright(
     *,
     har: Any,
@@ -1149,23 +1418,37 @@ def signup_with_patchright(
     )
     chrome = _chrome_path()
     sso = ""
+    from browser_session import patchright_fingerprint
+
+    fp = patchright_fingerprint(proxy, chrome)
     with sync_playwright() as playwright:
         emit("patchright driver entered")
         launch_kw: dict[str, Any] = {
             "headless": not headed,
             "no_viewport": True,
+            "locale": "en-US",
+            "user_agent": fp["user_agent"],
         }
-        clearance_cookies: list = []
+        if fp.get("timezone_id"):
+            launch_kw["timezone_id"] = fp["timezone_id"]
+        if fp.get("geolocation"):
+            launch_kw["geolocation"] = fp["geolocation"]
+            launch_kw["permissions"] = ["geolocation"]
+        width, height = fp["screen"]
+        launch_kw["args"] = [f"--window-size={width},{height}", *PATCHRIGHT_WEBGL_ARGS]
         if not headed:
-            clearance_cookies, clearance_ua = _harvest_headed_clearance(
-                playwright, proxy_cfg, chrome, emit
-            )
-            if clearance_ua:
-                launch_kw["user_agent"] = clearance_ua
+            launch_kw["args"].append("--headless=new")
+        clearance_cookies: list = []
         if proxy_cfg:
             launch_kw["proxy"] = proxy_cfg
         if chrome:
             launch_kw["executable_path"] = chrome
+        har_path = _live_har_path()
+        if har_path:
+            launch_kw["record_har_path"] = har_path
+            launch_kw["record_har_content"] = "embed"
+            launch_kw["record_har_mode"] = "full"
+            emit(f"har_record {Path(har_path).name}")
         context = playwright.chromium.launch_persistent_context(user_dir, **launch_kw)
         if clearance_cookies:
             try:
@@ -1173,7 +1456,8 @@ def signup_with_patchright(
             except Exception as exc:
                 emit(f"headed clearance cookies rejected: {exc}")
         browser = context.browser
-        _keep_castle_worker(context, emit)
+        sdk_ready: dict[str, bool] = {"seen": False}
+        _keep_castle_worker(context, emit, sdk_ready)
         net: dict[str, Any] = {"expect_email": email}
 
         def on_request(request):
@@ -1195,6 +1479,7 @@ def signup_with_patchright(
         context.on("response", on_response)
         try:
             page = context.pages[0] if context.pages else context.new_page()
+            _apply_patchright_fingerprint(context, page, fp, emit)
             _open_signup_page(page, emit)
             try:
                 page.wait_for_function(
@@ -1203,13 +1488,13 @@ def signup_with_patchright(
                 )
             except Exception as exc:
                 emit(f"castlePk wait: {exc}")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(200)
             # Patchright isolates Runtime.enable, so window.Castle is often
             # invisible to evaluate. Prefer the live page XHR as Castle source.
             emit("capture live send-code XHR from page submit")
             sent_at = time.time()
             captured = _capture_send_code(
-                page, email, emit, timeout=45.0, captured=net
+                page, email, emit, timeout=45.0, captured=net, sdk_ready=sdk_ready
             )
             otp_visible = _otp_visible(page)
             sent_via_page = _send_code_fired(captured, otp_visible=otp_visible)
@@ -1248,11 +1533,16 @@ def signup_with_patchright(
                 emit(f"send-code response status={status or 'unconfirmed'}")
                 if not send_code_already_accepted(status, _otp_visible(page)):
                     error_code = str(captured.get("send_error") or "")
-                    if error_code and not _send_code_resend_allowed(error_code):
-                        raise_send_code_rejection(status or "missing", error_code, email)
                     if not error_code:
                         emit("send-code status missing; wait before resend")
                         status = _await_send_status(captured, timeout=15.0) or status
+                        error_code = str(captured.get("send_error") or "")
+                    if error_code and not _send_code_resend_allowed(error_code):
+                        raise_send_code_rejection(
+                            status or captured.get("send_status") or "missing",
+                            error_code,
+                            email,
+                        )
                     if not send_code_already_accepted(status, _otp_visible(page)):
                         emit(f"send-code not accepted status={status or 'missing'}; resend")
                         status = _resend_verification_code(page, captured, emit, email)
@@ -1332,12 +1622,16 @@ def signup_with_patchright(
                 clicked = ""
                 _dump_page(page, emit, "profile-missing")
             emit(f"profile submit={clicked!r}")
-            st = _await_flag(captured, "create_status", timeout=30)
+            st = _await_flag(captured, "create_status", timeout=CREATE_PAGE_WAIT_S)
             data = captured.get("create_data") if isinstance(captured.get("create_data"), dict) else {}
             if not (200 <= st < 300):
                 emit(f"page create status={st or 'missing'}; fetch fallback")
-                minted = _mint_castle(page, email, emit, timeout=8.0)
-                fresh = str((minted or {}).get("token") or "").strip() or str(castle.get("token") or "")
+                # Evaluate cannot see the page Castle SDK (react_missing) and burns the
+                # whole mint timeout. The send-code token is the one that already got 200.
+                fresh = str(castle.get("token") or "").strip()
+                if not fresh:
+                    minted = _mint_castle(page, email, emit, timeout=8.0)
+                    fresh = str((minted or {}).get("token") or "").strip()
                 create = build_create_account(
                     email=email,
                     password=pw,
@@ -1355,10 +1649,10 @@ def signup_with_patchright(
             redirect = str(data.get("redirectUrl") or "") if isinstance(data, dict) else ""
             if redirect and not _cookie_chain_url(str(getattr(page, "url", "") or "")):
                 try:
-                    page.goto(redirect, wait_until="load", timeout=45000)
+                    page.goto(redirect, wait_until="domcontentloaded", timeout=45000)
                 except Exception as exc:
                     emit(f"cookie-chain goto: {exc}")
-            _wait_cookie_chain(page, emit, timeout=50, grace=2)
+            _wait_cookie_chain(page, emit, timeout=50, grace=2, context=context)
             sso = _sso_from_context(context) or sso_from_create_payload(data)
             if not sso and existing_email_payload(data):
                 emit(f"existingEmail={email} keys={list(data)[:8]}")
@@ -1370,6 +1664,11 @@ def signup_with_patchright(
             emit(f"sso len={len(sso)}")
         finally:
             context.close()
+            if har_path:
+                saved = Path(har_path)
+                emit(
+                    f"har_saved {saved.name} bytes={saved.stat().st_size if saved.is_file() else 0}"
+                )
             if browser is not None:
                 try:
                     browser.close()
