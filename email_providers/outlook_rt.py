@@ -107,6 +107,8 @@ _reserved: set[str] = set()
 _token_map: Dict[str, Dict[str, Any]] = {}
 _refresh_locks: Dict[str, threading.Lock] = {}
 _refresh_locks_guard = threading.Lock()
+# Send-code HTTP 400 is not a spent mailbox. Skip it for this process, keep it out of the used file.
+_reuse_later: set[str] = set()
 _CODE_WAIT_LIMIT = max(
     1, int(os.environ.get("OUTLOOK_RT_CODE_WAIT_CONCURRENCY", "3") or 3)
 )
@@ -798,7 +800,7 @@ def take_mailbox(
                 for acc in accounts:
                     cand = acc["email"].strip()
                     key = cand.lower()
-                    if key in used or key in _reserved:
+                    if key in used or key in _reserved or key in _reuse_later:
                         continue
                     if not _create_claim(path, cand, token_key):
                         continue
@@ -923,6 +925,15 @@ def take_mailbox(
         f"Outlook RT 库存耗尽或预检均失败（已用/预留/死号），文件: {path}；"
         f"used={used_file}{hint}"
     )
+
+
+def release_for_reuse(token_key: str = "", email: str = "") -> None:
+    """Drop the claim and leave the mailbox out of the used file."""
+    key = str(email or "").strip().lower()
+    if key:
+        with _lock:
+            _reuse_later.add(key)
+    release_reservation(token_key, email)
 
 
 def release_reservation(token_key: str = "", email: str = "") -> None:

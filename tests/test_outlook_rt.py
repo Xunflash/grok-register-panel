@@ -98,6 +98,34 @@ def test_take_mark_used_and_stats():
         assert "one@outlook.com" in used_file.read_text(encoding="utf-8")
 
 
+def test_send_code_400_returns_mailbox_without_used_mark():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [
+                {"email": "one@outlook.com", "refresh_token": "RT1"},
+                {"email": "two@outlook.com", "refresh_token": "RT2"},
+            ],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+        outlook_rt._reuse_later.clear()
+        try:
+            email, token = outlook_rt.take_mailbox(str(inv))
+            assert email == "one@outlook.com"
+            outlook_rt.release_for_reuse(token, email)
+            used_file = outlook_rt.used_path_for(str(inv))
+            assert not used_file.exists()
+            nxt, nxt_token = outlook_rt.take_mailbox(str(inv))
+            assert nxt == "two@outlook.com"
+            outlook_rt.release_reservation(nxt_token, nxt)
+        finally:
+            outlook_rt._reserved.clear()
+            outlook_rt._token_map.clear()
+            outlook_rt._reuse_later.clear()
+
+
 def test_append_inventory_lines_skips_duplicates_and_keeps_used():
     with tempfile.TemporaryDirectory() as tmp:
         inv = Path(tmp) / "stock.txt"
@@ -934,6 +962,7 @@ def test_wait_for_code_fast_fail_on_repeated_graph_401():
 if __name__ == "__main__":
     test_load_jsonl_and_text_formats()
     test_take_mark_used_and_stats()
+    test_send_code_400_returns_mailbox_without_used_mark()
     test_append_inventory_lines_skips_duplicates_and_keeps_used()
     test_cross_process_claims_are_unique()
     test_find_code_in_messages()
