@@ -209,6 +209,10 @@ _fp_screen_seq = 0
 _fp_screen_seq_lock = threading.Lock()
 
 
+_PATCHRIGHT_SCREENS = ((1366, 768), (1536, 864), (1440, 900), (1920, 1080))
+_PATCHRIGHT_HARDWARE = ((8, 8), (4, 8), (8, 16), (12, 8))
+
+
 def pick_fp_screen() -> Optional[Tuple[int, int]]:
     """Round-robin 1080p / 2K so a short test actually covers both sizes."""
     global _fp_screen_seq
@@ -219,6 +223,261 @@ def pick_fp_screen() -> Optional[Tuple[int, int]]:
         idx = _fp_screen_seq
         _fp_screen_seq += 1
     return choices[idx % len(choices)]
+
+
+def pick_intel_direct3d() -> Tuple[str, str]:
+    """Windows Intel Direct3D pair, matching the Patchright signups that passed send-code."""
+    fallback = (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) HD Graphics Direct3D11 vs_5_0 ps_5_0)",
+    )
+    try:
+        pairs = _WEBGL_PAIRS_CACHE.get("win")
+        if pairs is None:
+            from camoufox.webgl.sample import get_possible_pairs
+
+            pairs = list(get_possible_pairs().get("win") or [])
+            _WEBGL_PAIRS_CACHE["win"] = pairs
+    except Exception:
+        return fallback
+    intel = [
+        (str(vendor), str(renderer))
+        for vendor, renderer in pairs
+        if "intel" in str(vendor).lower()
+        and "direct3d" in str(renderer).lower()
+        and not any(skip in str(renderer).lower() for skip in _SKIP_RENDERER_SUBSTR)
+    ]
+    if not intel:
+        return fallback
+    import random
+
+    return random.choice(intel)
+
+
+def pick_patchright_screen() -> Tuple[int, int]:
+    """Rotate a window size that fits the current Xvfb."""
+    pinned = pick_fp_screen()
+    if pinned and pinned[0] <= 1920 and pinned[1] <= 1080:
+        return pinned
+    global _fp_screen_seq
+    with _fp_screen_seq_lock:
+        idx = _fp_screen_seq
+        _fp_screen_seq += 1
+    return _PATCHRIGHT_SCREENS[idx % len(_PATCHRIGHT_SCREENS)]
+
+
+def chromium_product_version(chrome_path: str = "") -> str:
+    """Real Chromium version so the Windows UA does not disagree with the binary."""
+    cached = getattr(_tls, "chrome_version", "")
+    if cached:
+        return str(cached)
+    path = str(chrome_path or os.environ.get("PATCHRIGHT_CHROME") or "").strip()
+    if not path:
+        for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+            if os.path.isfile(candidate):
+                path = candidate
+                break
+    version = ""
+    if path:
+        try:
+            import subprocess
+
+            out = subprocess.check_output(
+                [path, "--product-version"],
+                text=True,
+                timeout=8,
+                stderr=subprocess.DEVNULL,
+            )
+            version = str(out or "").strip().split()[-1]
+        except Exception:
+            version = ""
+    _tls.chrome_version = version
+    return version
+
+
+def pick_patchright_hardware() -> Tuple[int, int]:
+    """Cores and deviceMemory paired with the screen that was just chosen."""
+    index = max(_fp_screen_seq - 1, 0)
+    return _PATCHRIGHT_HARDWARE[index % len(_PATCHRIGHT_HARDWARE)]
+
+
+def chrome_client_hints(version: str) -> dict:
+    """Same Windows client hints the headed Chromium path sends through CDP."""
+    full = str(version or "").strip() or "145.0.0.0"
+    major = full.split(".", 1)[0]
+    return {
+        "brands": [
+            {"brand": "Chromium", "version": major},
+            {"brand": "Google Chrome", "version": major},
+            {"brand": "Not-A.Brand", "version": "24"},
+        ],
+        "fullVersionList": [
+            {"brand": "Chromium", "version": full},
+            {"brand": "Google Chrome", "version": full},
+            {"brand": "Not-A.Brand", "version": "24.0.0.0"},
+        ],
+        "fullVersion": full,
+        "platform": "Windows",
+        "platformVersion": "15.0.0",
+        "architecture": "x86",
+        "model": "",
+        "mobile": False,
+        "bitness": "64",
+        "wow64": False,
+    }
+
+
+def windows_chrome_user_agent(version: str) -> str:
+    ver = str(version or "").strip() or "145.0.0.0"
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{ver} Safari/537.36"
+    )
+
+
+def patchright_fingerprint(proxy: str = "", chrome_path: str = "") -> dict:
+    """Proxy-region timezone plus a fresh Windows screen and WebGL pair.
+
+    Locale stays en-US. GeoIP language would translate the signup buttons.
+    """
+    screen = pick_patchright_screen()
+    cores, memory = pick_patchright_hardware()
+    webgl = _pick_webgl_config("windows") or ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA)")
+    version = chromium_product_version(chrome_path)
+    fp = {
+        "locale": "en-US",
+        "languages": ["en-US", "en"],
+        "timezone_id": "",
+        "geolocation": None,
+        "screen": screen,
+        "hardware_concurrency": cores,
+        "device_memory": memory,
+        "webgl_vendor": webgl[0],
+        "webgl_renderer": webgl[1],
+        "user_agent": windows_chrome_user_agent(version),
+        "platform": "Win32",
+        "ua_metadata": chrome_client_hints(version),
+        "exit_ip": "",
+    }
+    raw_proxy = str(proxy or "").strip()
+    if not raw_proxy:
+        return fp
+    try:
+        exit_ip = _resolve_proxy_exit_ip(raw_proxy, timeout=8.0)
+    except Exception:
+        return fp
+    fp["exit_ip"] = exit_ip
+    try:
+        from camoufox.geolocation import get_geolocation
+
+        geo = get_geolocation(exit_ip)
+        fp["timezone_id"] = str(getattr(geo, "timezone", "") or "")
+        fp["geolocation"] = {
+            "latitude": float(geo.latitude),
+            "longitude": float(geo.longitude),
+        }
+    except Exception as exc:
+        fp["geo_error"] = type(exc).__name__
+    return fp
+
+
+# Orca manual signup HAR, 2026-10-26: Linux Chrome 150.0.7871.250.
+HAR_CHROME_FULL = "150.0.7871.250"
+HAR_CHROME_MAJOR = "150"
+HAR_GREASE_BRAND = "Not;A=Brand"
+HAR_GREASE_VERSION = "8"
+
+
+def castle_har_user_agent(full: str = "") -> str:
+    """Linux Chrome UA from the manual HAR. The full build is in the UA string."""
+    version = HAR_CHROME_FULL
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        f"Chrome/{version} Safari/537.36"
+    )
+
+
+def castle_har_client_hints(full: str = "", hints: dict | None = None) -> dict:
+    """sec-ch-ua from the manual HAR: Not;A=Brand 8 and Chromium 150."""
+    base = dict(hints or {})
+    version = HAR_CHROME_FULL
+    base.update(
+        {
+            "brands": [
+                {"brand": HAR_GREASE_BRAND, "version": HAR_GREASE_VERSION},
+                {"brand": "Chromium", "version": HAR_CHROME_MAJOR},
+            ],
+            "fullVersionList": [
+                {"brand": HAR_GREASE_BRAND, "version": f"{HAR_GREASE_VERSION}.0.0.0"},
+                {"brand": "Chromium", "version": version},
+            ],
+            "fullVersion": version,
+            "platform": "Linux",
+            "platformVersion": "",
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        }
+    )
+    return base
+
+
+def castle_sec_ch_headers(hints: dict | None = None) -> dict[str, str]:
+    """Client hints for the account fingerprint. Defaults match the Patchright Windows profile."""
+    meta = dict(hints or {})
+    brands = meta.get("brands") or [
+        {"brand": "Chromium", "version": "145"},
+        {"brand": "Google Chrome", "version": "145"},
+        {"brand": "Not-A.Brand", "version": "24"},
+    ]
+    platform = str(meta.get("platform") or "Windows")
+    mobile = "?1" if meta.get("mobile") else "?0"
+    sec_ch_ua = ", ".join(
+        f'"{item.get("brand")}";v="{item.get("version")}"' for item in brands if item.get("brand")
+    )
+    return {
+        "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua-mobile": mobile,
+        "sec-ch-ua-platform": f'"{platform}"',
+    }
+
+
+def castle_node_profile(fp: dict) -> dict:
+    """Fields the Node Castle mint may read. Proxy credentials stay out.
+
+    Identity follows the Patchright Windows profile: Chrome 145, Intel Direct3D
+    when that is the sampled WebGL pair, vendor and renderer kept distinct.
+    """
+    screen = fp.get("screen") or (1920, 1080)
+    hints = dict(fp.get("ua_metadata") or {})
+    if not hints.get("fullVersion"):
+        hints = chrome_client_hints("145.0.7632.159")
+    vendor = str(fp.get("webgl_vendor") or "")
+    renderer = str(fp.get("webgl_renderer") or "")
+    if not vendor or not renderer:
+        picked = _pick_webgl_config("windows") or (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Intel(R) HD Graphics Direct3D11 vs_5_0 ps_5_0)",
+        )
+        vendor, renderer = picked
+    return {
+        "user_agent": str(fp.get("user_agent") or "")
+        or windows_chrome_user_agent(str(hints.get("fullVersion") or "145.0.7632.159")),
+        "platform": str(fp.get("platform") or "Win32"),
+        "locale": str(fp.get("locale") or "en-US"),
+        "languages": list(fp.get("languages") or ["en-US", "en"]),
+        "hardware_concurrency": int(fp.get("hardware_concurrency") or 8),
+        "device_memory": int(fp.get("device_memory") or 8),
+        "screen": [int(screen[0]), int(screen[1])],
+        "timezone_id": str(fp.get("timezone_id") or ""),
+        "webgl_vendor": vendor,
+        "webgl_renderer": renderer,
+        "ua_metadata": hints,
+    }
 
 
 def set_proxy_rotate_hook(fn: Optional[Callable] = None) -> None:

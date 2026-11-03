@@ -7,6 +7,10 @@ def test_registration_scheme_includes_patchright_option():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
     assert 'value="protocol_patchright">协议注册（patchright）</option>' in html
+    assert 'value="curl_cffi">协议注册（curl_cffi）</option>' in html
+    assert 'id="turnstile_pool"' in html
+    assert 'id="ts-pool-title"' in html
+    assert "池空回退 CapSolver" in html
     assert 'id="registration_scheme"' in html
 
 

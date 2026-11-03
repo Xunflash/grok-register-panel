@@ -128,6 +128,7 @@ from register_flow import (
 from signup_scheme import (
     ENV_NAME as REGISTRATION_SCHEME_ENV,
     SCHEME_BROWSER,
+    SCHEME_CURL_CFFI,
     SCHEME_LABELS,
     SCHEME_PROTOCOL,
     SCHEME_PROTOCOL_PATCHRIGHT,
@@ -1186,6 +1187,13 @@ def _config_enabled(key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def cpa_token_prefer(token_mode: str) -> str:
+    """Authorization Code first. Protocol Device approve returns 403 for these SSOs."""
+    if str(token_mode or "").strip().lower() == "device_browser":
+        return "device"
+    return "auth_code"
+
+
 def release_browser_before_cpa(log_callback=None) -> bool:
     """Close Camoufox before import/Guard unless device_browser CPA needs the page."""
     token_mode = str(config.get("cpa_token_mode", "device_protocol") or "device_protocol").lower()
@@ -1474,9 +1482,11 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             _cpa_log("无活动浏览器，回退到协议 Device Flow")
             token_mode = "device_protocol"
 
-        # sso_to_token 的 prefer 只区分 device / auth_code
-        # browser_approve 是否传入决定走浏览器还是协议
-        prefer = "auth_code" if token_mode == "auth_code" else "device"
+        # sso_to_token 的 prefer 只区分 device / auth_code。
+        # browser_approve 是否传入决定走浏览器还是协议。
+        prefer = cpa_token_prefer(token_mode)
+        if token_mode == "device_protocol":
+            _cpa_log("协议 Device approve 会 403，先走 Authorization Code")
         browser_cb = _browser_approve if use_browser else None
 
         token = _s2cpa.sso_to_token(
@@ -3038,8 +3048,8 @@ def current_registration_scheme() -> str:
 
 
 def _patchright_skips_camoufox() -> bool:
-    """Patchright launches its own Chromium. Camoufox boot is not part of that flow."""
-    return current_registration_scheme() == SCHEME_PROTOCOL_PATCHRIGHT
+    """Patchright and curl_cffi do not boot Camoufox."""
+    return current_registration_scheme() in {SCHEME_PROTOCOL_PATCHRIGHT, SCHEME_CURL_CFFI}
 
 
 def run_browser_signup(log_callback, cancel_callback, *, mail_retries=3):
@@ -3274,7 +3284,7 @@ class GrokRegisterGUI:
         self.registration_scheme_combo = tk_option_menu(
             opt_frame,
             self.registration_scheme_var,
-            [SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT],
+            [SCHEME_BROWSER, SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT, SCHEME_CURL_CFFI],
             width=18,
         )
         self.registration_scheme_combo.pack(side=tk.LEFT)
@@ -4175,7 +4185,7 @@ class GrokRegisterGUI:
         try:
             try:
                 if _patchright_skips_camoufox():
-                    wlog("[*] Patchright 方案不启动 Camoufox")
+                    wlog(f"[*] {SCHEME_LABELS.get(current_registration_scheme(), '')} 不启动 Camoufox")
                 else:
                     start_browser(log_callback=wlog)
             except Exception as boot_exc:
@@ -4191,7 +4201,7 @@ class GrokRegisterGUI:
                 self.update_stats()
                 return
             if _patchright_skips_camoufox():
-                wlog("[*] 跳过 Camoufox，进入 Patchright 注册")
+                wlog(f"[*] 跳过 Camoufox，进入 {SCHEME_LABELS.get(current_registration_scheme(), '')}")
             else:
                 wlog("[*] 浏览器已启动")
             i = 0
@@ -4453,6 +4463,24 @@ def run_registration_cli(count):
         f"方案: {SCHEME_LABELS.get(current_registration_scheme(), current_registration_scheme())} | "
         f"代理池: {len(pool)} ({_proxy_pool_source})"
     )
+    if current_registration_scheme() == SCHEME_CURL_CFFI:
+        try:
+            from nobrowser_protocol.castle_env import prepare_castle_round
+
+            style_count = prepare_castle_round(str(config.get("proxy") or ""))
+            cli_log(f"[*] curl_cffi 本轮样式名 {style_count}")
+        except Exception as exc:
+            cli_log(f"[!] curl_cffi 样式名采集失败，沿用已有名单: {exc}")
+        try:
+            from nobrowser_protocol.turnstile_patchright import ensure_token_pool, pool_enabled
+
+            if pool_enabled():
+                pool = ensure_token_pool(proxy=str(config.get("proxy") or ""), log=cli_log)
+                cli_log(f"[*] curl_cffi Turnstile 预解池已启动 size={pool.size}")
+            else:
+                cli_log("[*] curl_cffi Turnstile 预解池已关闭")
+        except Exception as exc:
+            cli_log(f"[!] Turnstile 预解池启动失败: {exc}")
     _cli_interval_raw = str(config.get("account_interval", "0") or "0").strip()
     if _cli_interval_raw and _cli_interval_raw != "0":
         cli_log(f"[*] 账号间注册间隔: {_cli_interval_raw}s")
@@ -4583,7 +4611,9 @@ def run_registration_cli(count):
                 cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
                 try:
                     if _patchright_skips_camoufox():
-                        cli_log(f"[W{wid+1}] [*] Patchright 方案不启动 Camoufox")
+                        cli_log(
+                            f"[W{wid+1}] [*] {SCHEME_LABELS.get(current_registration_scheme(), '')} 不启动 Camoufox"
+                        )
                     else:
                         start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
@@ -5048,7 +5078,7 @@ def run_registration_cli(count):
                 set_thread_proxy(px)
                 cli_log(f"[*] 绑定代理: {redact_proxy(px) or '直连'}")
                 if _patchright_skips_camoufox():
-                    cli_log("[*] Patchright 方案不启动 Camoufox")
+                    cli_log(f"[*] {SCHEME_LABELS.get(current_registration_scheme(), '')} 不启动 Camoufox")
                     last_boot = None
                     break
                 start_browser(log_callback=cli_log)
@@ -5075,7 +5105,7 @@ def run_registration_cli(count):
             )
             return
         if _patchright_skips_camoufox():
-            cli_log("[*] 跳过 Camoufox，进入 Patchright 注册")
+            cli_log(f"[*] 跳过 Camoufox，进入 {SCHEME_LABELS.get(current_registration_scheme(), '')}")
         else:
             cli_log("[*] 浏览器已启动")
         i = 0

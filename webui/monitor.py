@@ -255,6 +255,8 @@ def load_control() -> dict:
         c.setdefault("add_count", 40)  # 再跑 N 个
         c.setdefault("mode", "orch")  # orch | batch
         c.setdefault("turnstile_provider", "yescaptcha")
+        c.setdefault("turnstile_pool", False)
+        c.setdefault("turnstile_pool_fallback", True)
         c.setdefault("registration_scheme", "browser")
         c.setdefault("stop_min_accounts", 10)
         c.setdefault("stop_min_success_rate", 65)
@@ -279,6 +281,8 @@ def save_control(updates: dict) -> dict:
         "base_cpa",
         "target_cpa",
         "turnstile_provider",
+        "turnstile_pool",
+        "turnstile_pool_fallback",
         "registration_scheme",
         "stop_min_accounts",
         "stop_min_success_rate",
@@ -323,6 +327,8 @@ def save_control(updates: dict) -> dict:
         c["turnstile_provider"] = (
             provider if provider in {"local", "yescaptcha", "capsolver"} else "yescaptcha"
         )
+        c["turnstile_pool"] = _coerce_debug_mode(c.get("turnstile_pool", False))
+        c["turnstile_pool_fallback"] = _coerce_debug_mode(c.get("turnstile_pool_fallback", True))
         try:
             from turnstile_solver import persist_turnstile_provider
 
@@ -340,6 +346,14 @@ def save_control(updates: dict) -> dict:
         c["debug_mode"] = _coerce_debug_mode(c.get("debug_mode"))
         try:
             persist_debug_mode(c["debug_mode"], ROOT / "config.json")
+        except Exception:
+            pass
+        try:
+            _persist_turnstile_pool_flags(
+                c["turnstile_pool"],
+                c["turnstile_pool_fallback"],
+                ROOT / "config.json",
+            )
         except Exception:
             pass
         for key in ("base_cpa", "target_cpa"):
@@ -818,6 +832,7 @@ def _registration_env() -> dict[str, str]:
     try:
         from signup_scheme import (
             ENV_NAME,
+            SCHEME_CURL_CFFI,
             SCHEME_PROTOCOL,
             SCHEME_PROTOCOL_PATCHRIGHT,
             resolve_registration_scheme,
@@ -828,8 +843,19 @@ def _registration_env() -> dict[str, str]:
             control.get("registration_scheme") or "browser"
         )
         env[ENV_NAME] = scheme
-        if scheme in {SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT}:
+        if scheme in {SCHEME_PROTOCOL, SCHEME_PROTOCOL_PATCHRIGHT, SCHEME_CURL_CFFI}:
             env["GROK_FP_ENHANCE"] = "0"
+        env["GROK_TURNSTILE_POOL"] = "1" if _coerce_debug_mode(control.get("turnstile_pool", False)) else "0"
+        env["GROK_TURNSTILE_POOL_FALLBACK"] = (
+            "1" if _coerce_debug_mode(control.get("turnstile_pool_fallback", True)) else "0"
+        )
+        if scheme == SCHEME_CURL_CFFI:
+            for chrome in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+                if Path(chrome).is_file():
+                    env.setdefault("PATCHRIGHT_CHROME", chrome)
+                    break
+            if Path("/tmp/.X11-unix/X121").exists():
+                env.setdefault("DISPLAY", ":121")
         if scheme == SCHEME_PROTOCOL_PATCHRIGHT:
             env.setdefault("PATCHRIGHT_HEADED", "1")
             for chrome in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
@@ -976,6 +1002,59 @@ def start_batch_only():
         return _start_batch_only_unlocked()
 
 
+def _persist_turnstile_pool_flags(pool_on: bool, fallback_on: bool, config_path) -> None:
+    path = Path(config_path)
+    data = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict):
+            data = loaded
+    data["turnstile_pool"] = bool(pool_on)
+    data["turnstile_pool_fallback"] = bool(fallback_on)
+    atomic_write_json(path, data)
+
+
+def _turnstile_pool_status(control: dict) -> dict:
+    try:
+        from nobrowser_protocol.turnstile_patchright import read_published_pool_snapshot
+
+        snap = read_published_pool_snapshot(LOG_DIR / "turnstile_pool.json")
+    except Exception:
+        snap = {
+            "depth": 0,
+            "ready": 0,
+            "ttl_s": 300,
+            "oldest_remaining_s": None,
+            "pools": [],
+            "updated_at": None,
+        }
+    updated = snap.get("updated_at")
+    age = None
+    try:
+        if updated is not None:
+            age = max(0, int(time.time() - float(updated)))
+    except (TypeError, ValueError):
+        age = None
+    last_error = ""
+    for row in snap.get("pools") or []:
+        if isinstance(row, dict) and row.get("last_error"):
+            last_error = str(row.get("last_error") or "")
+            break
+    return {
+        "enabled": bool(control.get("turnstile_pool", False)),
+        "fallback": bool(control.get("turnstile_pool_fallback", True)),
+        "ready": int(snap.get("ready") or 0),
+        "depth": int(snap.get("depth") or 0),
+        "ttl_s": int(snap.get("ttl_s") or 300),
+        "oldest_remaining_s": snap.get("oldest_remaining_s"),
+        "updated_age_s": age,
+        "last_error": last_error[:180],
+    }
+
+
 def snapshot():
     log = discover_log()
     parsed = parse_log(log) if log else {"error": "no log"}
@@ -1035,6 +1114,7 @@ def snapshot():
         "eta": eta,
         "traffic": traffic,
         "traffic_summary": traffic_summary,
+        "turnstile_pool": _turnstile_pool_status(control),
         "blacklist": {
             "count": bl.get("count"),
             "asns": bl.get("asns"),
@@ -2213,11 +2293,26 @@ HTML = r"""<!DOCTYPE html>
         </select>
       </div>
       <div class="field">
+        <label for="turnstile_pool">预解池</label>
+        <select id="turnstile_pool" title="开启后，curl_cffi 一轮开始时用有头 Chromium 提前点击 Turnstile，建号时优先取池里的 token。">
+          <option value="on">开启</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="turnstile_pool_fallback">池空回退 CapSolver</label>
+        <select id="turnstile_pool_fallback" title="预解池没有可用 token 时，是否改走当前打码方式里的云打码。关闭后池空直接失败。">
+          <option value="on">开启</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="registration_scheme">注册方案</label>
-        <select id="registration_scheme" title="浏览器注册=Camoufox 表单点击；协议注册=Camoufox HAR 回放发码/建号；协议注册（patchright）=Patchright Chromium HAR 回放。Turnstile 仍走云打码。">
+        <select id="registration_scheme" title="浏览器注册=Camoufox 表单点击；协议注册=Camoufox HAR 回放；协议注册（patchright）=Patchright Chromium；协议注册（curl_cffi）=curl_cffi 发码建号，Castle 在 Node 里按本轮样式名和账号指纹生成。Turnstile 仍走云打码。">
           <option value="browser">浏览器注册</option>
           <option value="protocol">协议注册</option>
           <option value="protocol_patchright">协议注册（patchright）</option>
+          <option value="curl_cffi">协议注册（curl_cffi）</option>
         </select>
       </div>
       <div class="field"><label for="batch_count">单批数量</label>
@@ -2460,6 +2555,8 @@ HTML = r"""<!DOCTYPE html>
         <div class="mail-provider-actions">
           <button class="primary" id="mail-provider-save" onclick="saveEmailProviderConfig()">保存配置</button>
           <button id="mail-provider-test" onclick="testEmailProviderConnection()">测试当前提供商</button>
+          <button id="outlook-rt-refresh" hidden onclick="refreshOutlookRt()">刷新 Outlook RT</button>
+          <span class="mail-provider-meta mono" id="outlook-rt-refresh-status" hidden>未开始</span>
           <span class="mail-provider-meta mono" id="mail-provider-updated">尚未读取</span>
         </div>
         <div class="msg mail-provider-result" id="mail-provider-msg" role="status" aria-live="polite"></div>
@@ -2617,6 +2714,15 @@ HTML = r"""<!DOCTYPE html>
   </section>
 
   <section class="metric-grid panel-gap" id="kpis" aria-label="核心指标"></section>
+
+  <section class="card panel" aria-labelledby="ts-pool-title">
+    <div class="section-head">
+      <h2 id="ts-pool-title">Turnstile 预解池</h2>
+      <span class="section-meta mono" id="ts-pool-status">未启动</span>
+    </div>
+    <div class="chips" id="ts-pool-kpis"></div>
+    <div class="msg" id="ts-pool-error" role="status"></div>
+  </section>
 
   <section class="card panel rate-panel">
     <div class="section-head">
@@ -3315,6 +3421,12 @@ function renderEmailProviderFields(provider) {
   document.getElementById("mail-provider-fields").innerHTML = (definition.fields || []).map(field =>
     `<div class="field"><label for="mail-field-${esc(field.name)}">${esc(field.label)}</label>${emailProviderFieldControl(field)}</div>`
   ).join("") || '<div class="field"><label>服务配置</label><input disabled value="该服务商没有可编辑字段"/></div>';
+  const showOutlookRefresh = definition.id === "outlook_rt";
+  const outlookRefresh = document.getElementById("outlook-rt-refresh");
+  const outlookRefreshStatus = document.getElementById("outlook-rt-refresh-status");
+  if (outlookRefresh) outlookRefresh.hidden = !showOutlookRefresh;
+  if (outlookRefreshStatus) outlookRefreshStatus.hidden = !showOutlookRefresh;
+  if (showOutlookRefresh) refreshOutlookRtStatus();
   const domainProvider = document.getElementById("domain-provider");
   if (domainProvider && ["cloudflare", "cloudmail", "moemail", "yyds"].includes(definition.id)) {
     domainProvider.value = definition.id;
@@ -3401,6 +3513,38 @@ async function saveEmailProviderConfig() {
     setMsg("mail-provider-msg", result.provider_label + " 配置已保存", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
+}
+let outlookRtRunning = false;
+function outlookRtStatusText(data) {
+  if (!data) return "未开始";
+  if (data.error && !data.running && !data.done) return data.error;
+  const tail = data.running ? "进行中" : (data.finished_at ? (data.error || "已完成") : "未开始");
+  return `${data.workers || 16} 线程  ${data.done || 0}/${data.picked || 0}  成功 ${data.ok_count || 0}  失败 ${data.failed || 0}  已回写 ${data.saved || 0}  ${tail}`;
+}
+async function refreshOutlookRtStatus() {
+  const data = await api("/api/outlook-rt/refresh?_=" + Date.now(), { authHelp: false });
+  outlookRtRunning = !!data.running;
+  const status = document.getElementById("outlook-rt-refresh-status");
+  const button = document.getElementById("outlook-rt-refresh");
+  if (status) status.textContent = outlookRtStatusText(data);
+  if (button) button.textContent = data.running ? "停止刷新" : "刷新 Outlook RT";
+  return data;
+}
+async function refreshOutlookRt() {
+  const button = document.getElementById("outlook-rt-refresh");
+  if (button) button.disabled = true;
+  try {
+    if (outlookRtRunning) {
+      await api("/api/outlook-rt/refresh/stop", { method: "POST", body: "{}" });
+    } else {
+      setMsg("mail-provider-msg", "开始多线程刷新 Outlook RT，含已用邮箱…", "");
+      await api("/api/outlook-rt/refresh", { method: "POST", body: JSON.stringify({ workers: 16 }) });
+    }
+    await refreshOutlookRtStatus();
+  } catch (e) {
+    setMsg("mail-provider-msg", String(e.message || e), "err");
+  }
+  if (button) button.disabled = false;
 }
 async function testEmailProviderConnection() {
   const button = document.getElementById("mail-provider-test");
@@ -3580,7 +3724,7 @@ function fillControl(d) {
     if (matched) pendingControl = null;
   }
   const c = Object.assign({}, server, pendingControl || {});
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","registration_scheme","debug_mode"].includes(document.activeElement.id)) {
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","stop_min_accounts","stop_min_success_rate","mode","turnstile_provider","turnstile_pool","turnstile_pool_fallback","registration_scheme","debug_mode"].includes(document.activeElement.id)) {
     if (server.mode || server.workers != null) controlHydrated = true;
     return;
   }
@@ -3597,6 +3741,12 @@ function fillControl(d) {
   if (c.mode) document.getElementById("mode").value = c.mode;
   if (c.turnstile_provider && document.getElementById("turnstile_provider")) {
     document.getElementById("turnstile_provider").value = c.turnstile_provider;
+  }
+  if (document.getElementById("turnstile_pool")) {
+    document.getElementById("turnstile_pool").value = c.turnstile_pool === false ? "off" : "on";
+  }
+  if (document.getElementById("turnstile_pool_fallback")) {
+    document.getElementById("turnstile_pool_fallback").value = c.turnstile_pool_fallback === false ? "off" : "on";
   }
   if (c.registration_scheme && document.getElementById("registration_scheme")) {
     document.getElementById("registration_scheme").value = c.registration_scheme;
@@ -3616,6 +3766,8 @@ function controlBody() {
     stop_min_success_rate: Number((document.getElementById("stop_min_success_rate") || {}).value || 65),
     mode: document.getElementById("mode").value || "orch",
     turnstile_provider: (document.getElementById("turnstile_provider") || {}).value || "capsolver",
+    turnstile_pool: ((document.getElementById("turnstile_pool") || {}).value || "on") === "on",
+    turnstile_pool_fallback: ((document.getElementById("turnstile_pool_fallback") || {}).value || "on") === "on",
     registration_scheme: (document.getElementById("registration_scheme") || {}).value || "browser",
     debug_mode: ((document.getElementById("debug_mode") || {}).value || "off") === "on",
   };
@@ -3639,10 +3791,12 @@ async function saveCtrl() {
       stop_min_success_rate: j.stop_min_success_rate,
       mode: j.mode,
       turnstile_provider: j.turnstile_provider,
+      turnstile_pool: j.turnstile_pool !== false,
+      turnstile_pool_fallback: j.turnstile_pool_fallback !== false,
       registration_scheme: j.registration_scheme,
       debug_mode: !!j.debug_mode,
     };
-    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，方案 " + (j.registration_scheme || "") + "，HAR " + (j.debug_mode ? "开" : "关"), "ok");
+    setMsg("ctrl-msg", "设置已保存，并发数 " + j.workers + "，打码 " + (j.turnstile_provider || "") + "，预解池 " + (j.turnstile_pool === false ? "关" : "开") + "，回退 " + (j.turnstile_pool_fallback === false ? "关" : "开") + "，方案 " + (j.registration_scheme || "") + "，HAR " + (j.debug_mode ? "开" : "关"), "ok");
     bustStatusCache();
     setTimeout(refresh, 400);
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
@@ -4034,6 +4188,36 @@ function renderStats(s, opts) {
     }
   }
 }
+function renderTurnstilePool(pool) {
+  const status = document.getElementById("ts-pool-status");
+  const kpis = document.getElementById("ts-pool-kpis");
+  const err = document.getElementById("ts-pool-error");
+  if (!status || !kpis || !err) return;
+  const enabled = pool.enabled !== false;
+  const ready = Number(pool.ready) || 0;
+  const depth = Number(pool.depth) || 0;
+  const age = pool.updated_age_s;
+  let label = "未启动";
+  if (!enabled) label = "已关闭";
+  else if (age == null) label = "等待产出";
+  else if (ready > 0) label = "就绪 " + ready + "/" + (depth || ready);
+  else label = "池空";
+  status.textContent = label;
+  const remain = pool.oldest_remaining_s == null ? "--" : Math.max(0, Math.round(Number(pool.oldest_remaining_s))) + " 秒";
+  const ageText = age == null ? "--" : age + " 秒前";
+  const rows = [
+    ["开关", enabled ? "开启" : "关闭"],
+    ["就绪", ready + " / " + depth],
+    ["最早剩余", remain],
+    ["有效期", (Number(pool.ttl_s) || 300) + " 秒"],
+    ["快照", ageText],
+    ["池空回退", pool.fallback === false ? "关闭" : "开启"],
+  ];
+  kpis.innerHTML = rows.map(function (row) {
+    return '<div class="chip"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>';
+  }).join("");
+  err.textContent = pool.last_error ? String(pool.last_error) : "";
+}
 function render(d) {
   document.getElementById("clock").textContent = d.ts_human || "--";
   document.getElementById("logname").textContent =
@@ -4089,6 +4273,7 @@ function render(d) {
     ["每批平均流量", trafficSummary.bytes_per_batch != null ? formatBytes(trafficSummary.bytes_per_batch) : "--", "accent", trafficAverageSub],
     ["每个成功号平均流量", trafficSummary.bytes_per_success != null ? formatBytes(trafficSummary.bytes_per_success) : "--", "ok", trafficSuccessSub],
   ];
+  renderTurnstilePool(d.turnstile_pool || {});
   document.getElementById("kpis").innerHTML = kpis.map(([label, val, cls, sub]) =>
     `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(val)}</div><div class="sub">${esc(sub)}</div></div>`
   ).join("");
@@ -4289,6 +4474,9 @@ setInterval(() => {
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
   if (document.body.classList.contains("domain-view-open")) refreshEmailDomains(false);
+  if (document.body.classList.contains("domain-view-open") || outlookRtRunning) {
+    refreshOutlookRtStatus().catch(() => {});
+  }
 }, 3000);
 </script>
 </body>
@@ -4411,6 +4599,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/health":
             self._json(200, {"ok": True})
+            return
+        if u.path == "/api/outlook-rt/refresh":
+            if not self._require_read():
+                return
+            from webui.outlook_rt_refresh import status as outlook_rt_refresh_status
+
+            self._json(200, outlook_rt_refresh_status())
             return
         if u.path == "/api/maintenance":
             if self._require_read():
@@ -4566,7 +4761,15 @@ class Handler(BaseHTTPRequestHandler):
 
         state = MAINTENANCE.snapshot()
         try:
-            jobs = (process_running(), recovery_status(), sso_state_status(), proxy_test_status())
+            from webui.outlook_rt_refresh import status as outlook_rt_refresh_status
+
+            jobs = (
+                process_running(),
+                recovery_status(),
+                sso_state_status(),
+                proxy_test_status(),
+                outlook_rt_refresh_status(),
+            )
             state["background_active"] = sum(bool(job.get("running")) for job in jobs)
             state["drained"] = state["drained"] and not state["background_active"]
             self._json(200, state)
@@ -4730,6 +4933,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/outlook-rt/refresh":
+            from webui.outlook_rt_refresh import start as start_outlook_rt_refresh
+
+            self._json(200, start_outlook_rt_refresh((body or {}).get("workers")))
+            return
+        if u.path == "/api/outlook-rt/refresh/stop":
+            from webui.outlook_rt_refresh import stop as stop_outlook_rt_refresh
+
+            self._json(200, stop_outlook_rt_refresh())
             return
         if u.path == "/api/email-provider/test":
             try:

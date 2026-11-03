@@ -79,8 +79,17 @@ def test_wait_path_does_not_hold_browser_for_device_protocol():
             register.config["cpa_token_mode"] = previous["cpa_token_mode"]
 
 
+def test_protocol_device_mode_prefers_auth_code():
+    assert register.cpa_token_prefer("device_protocol") == "auth_code"
+    assert register.cpa_token_prefer("auth_code") == "auth_code"
+    assert register.cpa_token_prefer("device_browser") == "device"
+    src = Path(register.__file__).read_text(encoding="utf-8")
+    assert "prefer = cpa_token_prefer(token_mode)" in src
+
+
 if __name__ == "__main__":
     test_release_browser_before_cpa_closes_unless_device_browser()
     test_gui_cli_close_browser_before_add_sso_to_cpa()
     test_wait_path_does_not_hold_browser_for_device_protocol()
+    test_protocol_device_mode_prefers_auth_code()
     print("OK close browser before CPA")

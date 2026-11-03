@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -140,7 +141,7 @@ def test_enhance_on_no_proxy_keeps_en_us_and_adds_screen_webgl():
 
 def test_enhance_on_proxy_drops_locale_for_geoip():
     with _env(GROK_FP_ENHANCE="1"):
-        with _isolated_launch(proxies={"https": "http://user:pass@127.0.0.1:9"}):
+        with _isolated_launch(proxies={"https": "http://user:pass@proxy.example:8080"}):
             opts = create_browser_options(unique_profile=False)
             assert "locale" not in opts
             assert opts["geoip"] == "1.2.3.4"
@@ -158,7 +159,7 @@ def test_enhance_off_restores_old_launch_fingerprint():
         GROK_EXIT_IP_PREFIXES=None,
     ):
         assert fingerprint_enhance_enabled() is False
-        with _isolated_launch(proxies={"https": "http://user:pass@127.0.0.1:9"}):
+        with _isolated_launch(proxies={"https": "http://user:pass@proxy.example:8080"}):
             opts = create_browser_options(unique_profile=False)
             assert opts["locale"] == "en-US"
             assert "screen" not in opts
@@ -274,7 +275,7 @@ def test_enhance_off_screen_override_and_timezone():
         GROK_FP_SCREENS="1920x1080",
         GROK_EXIT_IP_PREFIXES="1.2",
     ):
-        with _isolated_launch(proxies={"https": "http://user:pass@127.0.0.1:9"}):
+        with _isolated_launch(proxies={"https": "http://user:pass@proxy.example:8080"}):
             import browser_session as bs
 
             orig = bs._screen_from_wh
@@ -295,7 +296,7 @@ def test_enhance_off_screen_override_and_timezone():
 def test_exit_ip_allowlist_rejects_outside_prefix():
     with _env(GROK_FP_ENHANCE="0", GROK_EXIT_IP_PREFIXES="104.207"):
         with _isolated_launch(
-            proxies={"https": "http://user:pass@127.0.0.1:9"},
+            proxies={"https": "http://user:pass@proxy.example:8080"},
             exit_ip="65.111.1.2",
         ):
             try:
@@ -305,6 +306,86 @@ def test_exit_ip_allowlist_rejects_outside_prefix():
                 assert "65.111.1.2" in str(exc)
             else:
                 raise AssertionError("expected allowlist reject")
+
+
+def test_patchright_fingerprint_follows_exit_and_rotates_profile():
+    import browser_session as session
+
+    class _Geo:
+        timezone = "America/Chicago"
+        latitude = 41.8
+        longitude = -87.6
+        locale = "pt-BR"
+
+    previous_ip = session._resolve_proxy_exit_ip
+    previous_webgl = session._pick_webgl_config
+    previous_version = session.chromium_product_version
+    renders = iter(
+        [
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, RTX A)"),
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, RTX B)"),
+        ]
+    )
+    session._resolve_proxy_exit_ip = lambda *_args, **_kwargs: "8.8.8.8"
+    session._pick_webgl_config = lambda *_args, **_kwargs: next(renders)
+    session.chromium_product_version = lambda *_args, **_kwargs: "145.0.7632.159"
+    import sys
+    import types
+
+    fake_geo = types.ModuleType("camoufox.geolocation")
+    fake_geo.get_geolocation = lambda *_args, **_kwargs: _Geo()
+    previous_camoufox = sys.modules.get("camoufox")
+    previous_geo = sys.modules.get("camoufox.geolocation")
+    sys.modules.setdefault("camoufox", types.ModuleType("camoufox"))
+    sys.modules["camoufox.geolocation"] = fake_geo
+    try:
+        first = session.patchright_fingerprint("http://user:secret@proxy.example:8080")
+        second = session.patchright_fingerprint("http://user:secret@proxy.example:8080")
+    finally:
+        if previous_geo is None:
+            sys.modules.pop("camoufox.geolocation", None)
+        else:
+            sys.modules["camoufox.geolocation"] = previous_geo
+        if previous_camoufox is None:
+            sys.modules.pop("camoufox", None)
+        else:
+            sys.modules["camoufox"] = previous_camoufox
+        session._resolve_proxy_exit_ip = previous_ip
+        session._pick_webgl_config = previous_webgl
+        session.chromium_product_version = previous_version
+    assert first["locale"] == "en-US"
+    assert first["timezone_id"] == "America/Chicago"
+    assert first["geolocation"]["latitude"] == 41.8
+    assert "Windows NT 10.0" in first["user_agent"]
+    assert "145.0.7632.159" in first["user_agent"]
+    assert "secret" not in first["user_agent"]
+    assert first["screen"] != second["screen"] or first["webgl_renderer"] != second["webgl_renderer"]
+    assert first["webgl_renderer"] != second["webgl_renderer"]
+    hints = first["ua_metadata"]
+    assert hints["fullVersion"] == "145.0.7632.159"
+    assert hints["architecture"] == "x86"
+    assert hints["platform"] == "Windows"
+    assert first["languages"] == ["en-US", "en"]
+    assert first["hardware_concurrency"] in {4, 8, 12}
+    assert first["device_memory"] in {8, 16}
+    profile = session.castle_node_profile(first)
+    blob = json.dumps(profile)
+    assert "secret" not in blob
+    assert "127.0.0.1" not in blob
+    assert profile["screen"][0] > 0
+    assert profile["timezone_id"] == "America/Chicago"
+    assert "Chrome/145.0.7632.159" in profile["user_agent"]
+    assert "Windows NT 10.0" in profile["user_agent"]
+    assert profile["platform"] == "Win32"
+    assert profile["webgl_vendor"] == "Google Inc. (NVIDIA)"
+    assert profile["webgl_renderer"] == "ANGLE (NVIDIA, RTX A)"
+    assert profile["ua_metadata"]["platform"] == "Windows"
+    assert profile["ua_metadata"]["fullVersion"] == "145.0.7632.159"
+    assert [item["brand"] for item in profile["ua_metadata"]["brands"]] == [
+        "Chromium",
+        "Google Chrome",
+        "Not-A.Brand",
+    ]
 
 
 def test_format_fingerprint_log_flags_screen_gt_xvfb():
@@ -334,6 +415,7 @@ if __name__ == "__main__":
     test_pick_webgl_skips_gtx980_and_software()
     test_format_fingerprint_log_flags_linux_leak()
     test_format_fingerprint_log_clean_windows()
+    test_patchright_fingerprint_follows_exit_and_rotates_profile()
     test_format_fingerprint_log_flags_screen_gt_xvfb()
     test_parse_screen_spec_and_choices()
     test_exit_ip_prefix_allowlist()

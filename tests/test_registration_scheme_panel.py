@@ -24,6 +24,7 @@ def test_monitor_html_exposes_registration_scheme_select():
     assert 'value="browser">浏览器注册</option>' in html
     assert 'value="protocol">协议注册</option>' in html
     assert 'value="protocol_patchright">协议注册（patchright）</option>' in html
+    assert 'value="curl_cffi">协议注册（curl_cffi）</option>' in html
     assert "registration_scheme:" in mon
     assert "fillControl" in mon
     assert 'document.getElementById("registration_scheme")' in mon
